@@ -22,6 +22,8 @@ struct WebProfile {
 }
 
 impl WebProfile {
+    /// The loopback URL the wrapped `dsh web` profile serves on, built from
+    /// its configured host and port.
     fn url(&self) -> String {
         format!("http://{}:{}", self.host, self.port)
     }
@@ -37,6 +39,8 @@ fn dsh_command() -> Command {
     }
 }
 
+/// Spawns `dsh --profile web` bound to `host:port` with stdio discarded,
+/// since this shell has no console to show it in.
 fn spawn_web_profile(host: &str, port: &str) -> std::io::Result<Child> {
     dsh_command()
         .args(["--profile", "web", "--host", host, "--port", port, "--no-open"])
@@ -46,6 +50,9 @@ fn spawn_web_profile(host: &str, port: &str) -> std::io::Result<Child> {
         .spawn()
 }
 
+/// Kills and waits on the wrapped `dsh web` child process, if it is still
+/// running. Called on window close and on app exit so no orphaned `dsh`
+/// process survives the shell.
 fn shutdown(profile: &State<WebProfile>) {
     if let Some(mut child) = profile.child.lock().expect("web profile mutex poisoned").take() {
         let _ = child.kill();
@@ -75,6 +82,10 @@ font-family:sans-serif;display:flex;align-items:center;\
 justify-content:center;height:100vh;margin:0'>\
 <p>Starting DeepSeek Harness&hellip;</p></body></html>";
 
+/// Spawns the `dsh web` profile, opens a single window showing a loading
+/// placeholder, then navigates that window to the profile once it accepts
+/// connections (or to an error page after a 30s timeout). Tears the child
+/// process down on window close or app exit.
 fn main() {
     let host = env::var("DSH_WEB_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
     let port = env::var("DSH_WEB_PORT").unwrap_or_else(|_| "5175".to_string());
