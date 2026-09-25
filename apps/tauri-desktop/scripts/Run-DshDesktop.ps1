@@ -1,21 +1,21 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Runs the DSH Web tray wrapper with no visible window or console.
+    Runs the DSH Tauri desktop shell.
 
 .DESCRIPTION
-    Launches the built `dsh-windows-tray.exe` (installed by the MSI/NSIS
-    installer, or a locally built binary) fully hidden: no console, no
-    taskbar window. The wrapper itself spawns `dsh --profile web` in the
-    background and exposes only a tray icon. Use -Stop to terminate a
-    running instance.
+    Launches the built `dsh-tauri-desktop.exe` (installed by the MSI/NSIS
+    installer, or a locally built binary). The shell shows a single normal
+    window with the dsh web UI; it spawns and owns `dsh --profile web` in
+    the background for its lifetime and stops it when the window closes.
+    Use -Stop to terminate a running instance without closing its window.
 
 .PARAMETER ExePath
-    Path to dsh-windows-tray.exe. Defaults to the standard per-user install
+    Path to dsh-tauri-desktop.exe. Defaults to the standard per-user install
     location, falling back to a local release build under target/release.
 
 .PARAMETER DshCliPath
-    Optional path to the `dsh` executable/script the wrapper should launch.
+    Optional path to the `dsh` executable/script the shell should launch.
     Passed through as DSH_CLI_PATH; omit to resolve `dsh` from PATH.
 
 .PARAMETER Host
@@ -25,7 +25,7 @@
     Port the wrapped web profile binds to. Default 5175.
 
 .PARAMETER Stop
-    Stop a running dsh-windows-tray.exe instance instead of starting one.
+    Stop a running dsh-tauri-desktop.exe instance instead of starting one.
 
 .EXAMPLE
     .\Run-DshWebTray.ps1
@@ -46,7 +46,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$processName = 'dsh-windows-tray'
+$processName = 'dsh-tauri-desktop'
 
 if ($Stop) {
     $running = Get-Process -Name $processName -ErrorAction SilentlyContinue
@@ -60,14 +60,14 @@ if ($Stop) {
 }
 
 if (-not $ExePath) {
-    $installed = Join-Path $env:LOCALAPPDATA 'DSH Web Tray\dsh-windows-tray.exe'
-    $localBuild = Join-Path $PSScriptRoot '..\target\release\dsh-windows-tray.exe'
+    $installed = Join-Path $env:LOCALAPPDATA 'DeepSeek Harness\dsh-tauri-desktop.exe'
+    $localBuild = Join-Path $PSScriptRoot '..\target\release\dsh-tauri-desktop.exe'
     if (Test-Path $installed) {
         $ExePath = $installed
     } elseif (Test-Path $localBuild) {
         $ExePath = (Resolve-Path $localBuild).Path
     } else {
-        throw "dsh-windows-tray.exe not found. Install it or pass -ExePath explicitly. Checked: '$installed' and '$localBuild'."
+        throw "dsh-tauri-desktop.exe not found. Install it or pass -ExePath explicitly. Checked: '$installed' and '$localBuild'."
     }
 }
 
@@ -86,7 +86,5 @@ if ($DshCliPath) {
     $env:DSH_CLI_PATH = $DshCliPath
 }
 
-# WindowStyle Hidden keeps the wrapper (and, transitively, the dsh web
-# process it spawns) off the taskbar and without a console window.
-Start-Process -FilePath $ExePath -WindowStyle Hidden
+Start-Process -FilePath $ExePath
 Write-Host "Started $processName (web profile at http://${Host}:${Port})."

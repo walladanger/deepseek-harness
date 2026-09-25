@@ -46,4 +46,4 @@ worktrees/
 .agents/worktrees/
 .typert-*/
 native/system/test/bin/
-apps/windows-tray/target/
+apps/tauri-desktop/target/

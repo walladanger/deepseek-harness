@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "DSH Web Tray",
+  "productName": "DeepSeek Harness",
   "version": "0.1.0",
-  "identifier": "ai.deepseek.dsh.windows-tray",
+  "identifier": "ai.deepseek.dsh.tauri-desktop",
   "app": {
     "windows": [],
     "security": {

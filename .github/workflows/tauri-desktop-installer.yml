@@ -1,18 +1,18 @@
-# Builds the windowless Windows tray wrapper (apps/windows-tray) into an
+# Builds the single-window Tauri desktop shell (apps/tauri-desktop) into an
 # MSI and NSIS installer. Separate from ci.yml because this is a Rust/Tauri
 # build on windows-latest, not part of the pnpm/Node workspace matrix.
-name: Windows Tray Installer
+name: Tauri Desktop Installer
 
 on:
   pull_request:
     paths:
-      - '.github/workflows/windows-tray-installer.yml'
-      - 'apps/windows-tray/**'
+      - '.github/workflows/tauri-desktop-installer.yml'
+      - 'apps/tauri-desktop/**'
   push:
     branches: [master]
     paths:
-      - '.github/workflows/windows-tray-installer.yml'
-      - 'apps/windows-tray/**'
+      - '.github/workflows/tauri-desktop-installer.yml'
+      - 'apps/tauri-desktop/**'
   workflow_dispatch:
 
 concurrency:
@@ -24,7 +24,7 @@ permissions:
 
 defaults:
   run:
-    working-directory: apps/windows-tray
+    working-directory: apps/tauri-desktop
 
 jobs:
   build:
@@ -42,22 +42,22 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            apps/windows-tray/target
-          key: windows-tray-cargo-${{ runner.os }}-${{ hashFiles('apps/windows-tray/Cargo.lock') }}
+            apps/tauri-desktop/target
+          key: tauri-desktop-cargo-${{ runner.os }}-${{ hashFiles('apps/tauri-desktop/Cargo.lock') }}
           restore-keys: |
-            windows-tray-cargo-${{ runner.os }}-
+            tauri-desktop-cargo-${{ runner.os }}-
 
       - name: Build MSI and NSIS installers
         uses: tauri-apps/tauri-action@v0
         with:
-          projectPath: apps/windows-tray
+          projectPath: apps/tauri-desktop
           args: --bundles msi,nsis
 
       - name: Upload installers
         uses: actions/upload-artifact@v4
         with:
-          name: dsh-windows-tray-installers
+          name: dsh-tauri-desktop-installers
           path: |
-            apps/windows-tray/target/release/bundle/msi/*.msi
-            apps/windows-tray/target/release/bundle/nsis/*.exe
+            apps/tauri-desktop/target/release/bundle/msi/*.msi
+            apps/tauri-desktop/target/release/bundle/nsis/*.exe
           if-no-files-found: error
