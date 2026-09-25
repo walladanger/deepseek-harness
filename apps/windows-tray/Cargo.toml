@@ -1,0 +1,19 @@
+[package]
+name = "dsh-windows-tray"
+version = "0.1.0"
+description = "Windowless Windows tray wrapper that runs the dsh web profile in the background."
+edition = "2021"
+license = "MIT"
+publish = false
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[[bin]]
+name = "dsh-windows-tray"
+path = "src/main.rs"
