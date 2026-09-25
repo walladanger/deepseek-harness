@@ -30,12 +30,23 @@ impl WebProfile {
 }
 
 /// Locates the `dsh` launcher: `DSH_CLI_PATH` overrides discovery for
-/// packaging or development; otherwise `dsh` is resolved from `PATH`, which
-/// is how an end-user install of the harness CLI is expected to be reached.
+/// packaging or development and is launched directly (it already names a
+/// concrete executable, extension included). Otherwise `dsh` is resolved
+/// from `PATH`, which is how an end-user install of the harness CLI is
+/// expected to be reached. On Windows that install is commonly an npm-style
+/// `dsh.cmd` shim, which `Command::new("dsh")` cannot find on its own (Rust
+/// does not apply `PATHEXT` the way `cmd.exe` does), so the fallback runs
+/// through `cmd /C`, which does.
 fn dsh_command() -> Command {
-    match env::var("DSH_CLI_PATH") {
-        Ok(path) => Command::new(path),
-        Err(_) => Command::new("dsh"),
+    if let Ok(path) = env::var("DSH_CLI_PATH") {
+        return Command::new(path);
+    }
+    if cfg!(target_os = "windows") {
+        let mut command = Command::new("cmd");
+        command.args(["/C", "dsh"]);
+        command
+    } else {
+        Command::new("dsh")
     }
 }
 
@@ -53,21 +64,50 @@ fn spawn_web_profile(host: &str, port: &str) -> std::io::Result<Child> {
 /// Kills and waits on the wrapped `dsh web` child process, if it is still
 /// running. Called on window close and on app exit so no orphaned `dsh`
 /// process survives the shell.
+///
+/// On Windows, `dsh` is launched through `cmd /C` (see `dsh_command`), so
+/// the tracked child is `cmd.exe`, not the Node process it starts in turn;
+/// `Child::kill` would only stop `cmd.exe` and leak that Node process and
+/// its bound port. `taskkill /T` kills the whole process tree instead.
 fn shutdown(profile: &State<WebProfile>) {
     if let Some(mut child) = profile.child.lock().expect("web profile mutex poisoned").take() {
-        let _ = child.kill();
+        if cfg!(target_os = "windows") {
+            let _ = Command::new("taskkill")
+                .arg("/PID")
+                .arg(child.id().to_string())
+                .arg("/T")
+                .arg("/F")
+                .status();
+        } else {
+            let _ = child.kill();
+        }
         let _ = child.wait();
     }
 }
 
-/// Blocks the calling thread until `host:port` accepts a TCP connection, or
+/// Blocks the calling thread until the wrapped `dsh web` child accepts a TCP
+/// connection on its configured host/port, the child exits early, or
 /// `timeout` elapses. Used to hold the loading screen until `dsh web` is
 /// actually ready, instead of navigating the window straight into a
 /// connection-refused error page.
-fn wait_for_port(host: &str, port: &str, timeout: Duration) -> bool {
-    let address = format!("{host}:{port}");
+///
+/// Checking the child's own status on each poll (rather than treating any
+/// successful TCP connect as readiness) avoids two failure modes: waiting
+/// out the full timeout against a child that already crashed, and — if an
+/// unrelated process happens to already own the configured port — reporting
+/// readiness for a server that was never actually started here.
+fn wait_for_port(profile: &WebProfile, timeout: Duration) -> bool {
+    let address = format!("{}:{}", profile.host, profile.port);
     let deadline = std::time::Instant::now() + timeout;
     while std::time::Instant::now() < deadline {
+        {
+            let mut child = profile.child.lock().expect("web profile mutex poisoned");
+            match child.as_mut().map(|c| c.try_wait()) {
+                Some(Ok(Some(_status))) => return false,
+                Some(Ok(None)) | None => {}
+                Some(Err(_)) => return false,
+            }
+        }
         if TcpStream::connect(&address).is_ok() {
             return true;
         }
@@ -97,7 +137,7 @@ fn main() {
     tauri::Builder::default()
         .manage(WebProfile { host, port, child: Mutex::new(Some(child)) })
         .setup(|app: &mut tauri::App| {
-            let window = WebviewWindowBuilder::new(app, "main", WebviewUrl::External(LOADING_HTML.parse()?))
+            WebviewWindowBuilder::new(app, "main", WebviewUrl::External(LOADING_HTML.parse()?))
                 .title("DeepSeek Harness")
                 .inner_size(1280.0, 860.0)
                 .min_inner_size(800.0, 600.0)
@@ -106,7 +146,7 @@ fn main() {
             let handle: AppHandle = app.handle().clone();
             thread::spawn(move || {
                 let profile = handle.state::<WebProfile>();
-                let ready = wait_for_port(&profile.host, &profile.port, Duration::from_secs(30));
+                let ready = wait_for_port(&profile, Duration::from_secs(30));
                 let url = if ready {
                     profile.url()
                 } else {

@@ -8,39 +8,47 @@
     installer, or a locally built binary). The shell shows a single normal
     window with the dsh web UI; it spawns and owns `dsh --profile web` in
     the background for its lifetime and stops it when the window closes.
-    Use -Stop to terminate a running instance without closing its window.
+    Use -Stop to close a running instance's window (triggering its normal
+    shutdown, which stops the wrapped `dsh` process) rather than killing it.
 
 .PARAMETER ExePath
     Path to dsh-tauri-desktop.exe. Defaults to the standard per-user install
-    location, falling back to a local release build under target/release.
+    location, then the default WiX MSI (Program Files) location, then a
+    local release build under target/release.
 
 .PARAMETER DshCliPath
     Optional path to the `dsh` executable/script the shell should launch.
     Passed through as DSH_CLI_PATH; omit to resolve `dsh` from PATH.
 
-.PARAMETER Host
+.PARAMETER WebHost
     Loopback host the wrapped web profile binds to. Default 127.0.0.1.
+    Aliased as -Host for convenience; $Host is a reserved PowerShell
+    automatic variable, so the parameter itself cannot be named Host.
 
 .PARAMETER Port
     Port the wrapped web profile binds to. Default 5175.
 
 .PARAMETER Stop
-    Stop a running dsh-tauri-desktop.exe instance instead of starting one.
+    Close a running dsh-tauri-desktop.exe instance's window instead of
+    starting one. This triggers the shell's own close handling, which stops
+    the wrapped `dsh` process; if the window does not close within 10s, the
+    process is force-stopped as a fallback.
 
 .EXAMPLE
-    .\Run-DshWebTray.ps1
+    .\Run-DshDesktop.ps1
 
 .EXAMPLE
-    .\Run-DshWebTray.ps1 -Port 5180 -DshCliPath 'C:\tools\dsh\dsh.cmd'
+    .\Run-DshDesktop.ps1 -Port 5180 -DshCliPath 'C:\tools\dsh\dsh.cmd'
 
 .EXAMPLE
-    .\Run-DshWebTray.ps1 -Stop
+    .\Run-DshDesktop.ps1 -Stop
 #>
 [CmdletBinding()]
 param(
     [string]$ExePath,
     [string]$DshCliPath,
-    [string]$Host = '127.0.0.1',
+    [Alias('Host')]
+    [string]$WebHost = '127.0.0.1',
     [string]$Port = '5175',
     [switch]$Stop
 )
@@ -54,20 +62,35 @@ if ($Stop) {
         Write-Host "$processName is not running."
         exit 0
     }
-    $running | Stop-Process -Force
+    foreach ($process in $running) {
+        # CloseMainWindow sends a normal close request, so the shell's own
+        # CloseRequested handler runs and stops the dsh child it owns.
+        # Stop-Process -Force would skip that handler and leak the child.
+        [void]$process.CloseMainWindow()
+    }
+    $exited = $running | Wait-Process -Timeout 10 -ErrorAction SilentlyContinue
+    $stillRunning = Get-Process -Name $processName -ErrorAction SilentlyContinue
+    if ($stillRunning) {
+        Write-Warning "$processName did not close within 10s; force-stopping (its dsh child may be left running)."
+        $stillRunning | Stop-Process -Force
+    }
     Write-Host "Stopped $processName."
     exit 0
 }
 
 if (-not $ExePath) {
     $installed = Join-Path $env:LOCALAPPDATA 'DeepSeek Harness\dsh-tauri-desktop.exe'
+    $programFiles = Join-Path ${env:ProgramFiles} 'DeepSeek Harness\dsh-tauri-desktop.exe'
+    $programFilesX86 = Join-Path ${env:ProgramFiles(x86)} 'DeepSeek Harness\dsh-tauri-desktop.exe'
     $localBuild = Join-Path $PSScriptRoot '..\target\release\dsh-tauri-desktop.exe'
-    if (Test-Path $installed) {
-        $ExePath = $installed
+    $candidates = @($installed, $programFiles, $programFilesX86)
+    $found = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+    if ($found) {
+        $ExePath = $found
     } elseif (Test-Path $localBuild) {
         $ExePath = (Resolve-Path $localBuild).Path
     } else {
-        throw "dsh-tauri-desktop.exe not found. Install it or pass -ExePath explicitly. Checked: '$installed' and '$localBuild'."
+        throw "dsh-tauri-desktop.exe not found. Install it or pass -ExePath explicitly. Checked: $($candidates -join ', ') and '$localBuild'."
     }
 }
 
@@ -80,11 +103,11 @@ if (Get-Process -Name $processName -ErrorAction SilentlyContinue) {
     exit 0
 }
 
-$env:DSH_WEB_HOST = $Host
+$env:DSH_WEB_HOST = $WebHost
 $env:DSH_WEB_PORT = $Port
 if ($DshCliPath) {
     $env:DSH_CLI_PATH = $DshCliPath
 }
 
 Start-Process -FilePath $ExePath
-Write-Host "Started $processName (web profile at http://${Host}:${Port})."
+Write-Host "Started $processName (web profile at http://${WebHost}:${Port})."
