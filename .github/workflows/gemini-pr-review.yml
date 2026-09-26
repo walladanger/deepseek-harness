@@ -45,16 +45,27 @@ jobs:
                 github.ref }}
           fetch-depth: 0
 
-      # Gemini CLI auto-loads .gemini/, .env, GEMINI.md (and nested
-      # GEMINI.md), and .agents/skills/*/SKILL.md as trusted instructions
-      # and tool configuration. The checked-out ref may be an external
-      # fork's head, so restore master's copies of the instruction
-      # surfaces rather than trusting whatever the PR itself carries.
-      - name: Reset agent-instruction surfaces to master's trusted copies
+      # Gemini CLI auto-loads .gemini/, .env, every GEMINI.md (root and
+      # nested), and .agents/skills/*/SKILL.md as trusted instructions and
+      # tool configuration. The checked-out ref may be an external fork's
+      # head, so purge all of them outright rather than only overwriting
+      # paths that also exist on master — a `git checkout <ref> -- <path>`
+      # restore leaves a PR-added file untouched, and this repository's
+      # master has no root GEMINI.md to restore in the first place.
+      - name: Remove untrusted agent-instruction surfaces
         run: |
-          rm -rf .gemini .env
+          rm -rf .gemini .env .agents
+          find . -name 'GEMINI.md' -delete
           git fetch origin master
-          git checkout origin/master -- GEMINI.md .agents/ 2>/dev/null || true
+          git checkout origin/master -- .agents/ 2>/dev/null || true
+
+      # google-github-actions/run-gemini-cli's own env: block does not
+      # reach the token into Gemini CLI's shell tool, which strips
+      # GH_TOKEN/GITHUB_TOKEN from spawned subprocesses; authenticate gh
+      # at the system level instead so `gh pr review`/`gh pr comment`
+      # keep working from inside the agent's shell calls.
+      - name: Authenticate GitHub CLI
+        run: echo "${{ github.token }}" | gh auth login --with-token
 
       - name: Run Gemini CLI review
         uses: google-github-actions/run-gemini-cli@v0
@@ -62,10 +73,6 @@ jobs:
           # The checked-out CI workspace is never interactively trusted, so
           # Gemini CLI's headless trusted-folder check must be bypassed here.
           GEMINI_CLI_TRUST_WORKSPACE: 'true'
-          # run-gemini-cli does not post PR review comments itself; the
-          # agent's own `gh pr review`/`gh pr comment` calls need a token.
-          GITHUB_TOKEN: ${{ github.token }}
-          GH_TOKEN: ${{ github.token }}
         with:
           gemini_api_key: ${{ secrets.GEMINI_CLI_KEY }}
           github_pr_number: ${{ github.event.pull_request.number || github.event.issue.number }}
