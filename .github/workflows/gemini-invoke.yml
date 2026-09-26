@@ -40,10 +40,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          head_repo=$(gh pr view "${{ github.event.issue.number }}" --json headRepository --jq '.headRepository.name')
-          head_owner=$(gh pr view "${{ github.event.issue.number }}" --json headRepositoryOwner --jq '.headRepositoryOwner.login')
-          if [ "${head_owner}/${head_repo}" != "${{ github.repository }}" ]; then
-            echo "::error::PR #${{ github.event.issue.number }} head is an external fork (${head_owner}/${head_repo}); gemini-invoke does not run against fork checkouts."
+          head_repo_full=$(gh pr view "${{ github.event.issue.number }}" --json headRepository --jq '.headRepository.nameWithOwner')
+          if [ "${head_repo_full}" != "${{ github.repository }}" ]; then
+            echo "::error::PR #${{ github.event.issue.number }} head is an external fork (${head_repo_full}); gemini-invoke does not run against fork checkouts."
             exit 1
           fi
 
@@ -78,7 +77,9 @@ jobs:
       # at the system level instead so the agent's own `gh`/`git` tool
       # calls (commenting, committing, pushing) stay authenticated.
       - name: Authenticate GitHub CLI
-        run: echo "${{ github.token }}" | gh auth login --with-token
+        run: |
+          echo "${{ github.token }}" | gh auth login --with-token
+          gh auth setup-git
 
       - name: Run Gemini CLI
         uses: google-github-actions/run-gemini-cli@v0

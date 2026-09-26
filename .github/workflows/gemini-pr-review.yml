@@ -37,35 +37,55 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          # A PR comment's default checkout is the base branch; check out
-          # the PR's own head so the diff being reviewed actually exists.
+          # Check out the PR's actual head consistently for both trigger
+          # paths. github.ref for a pull_request event resolves to
+          # refs/pull/N/merge, which GitHub never generates for a PR with
+          # merge conflicts and which reviews a different tree than the
+          # head commit an issue_comment-triggered run inspects.
           ref: >-
-            ${{ github.event.issue.pull_request &&
-                format('refs/pull/{0}/head', github.event.issue.number) ||
-                github.ref }}
+            refs/pull/${{ github.event.pull_request.number ||
+                           github.event.issue.number }}/head
           fetch-depth: 0
 
-      # Gemini CLI auto-loads .gemini/, .env, every GEMINI.md (root and
-      # nested), and .agents/skills/*/SKILL.md as trusted instructions and
-      # tool configuration. The checked-out ref may be an external fork's
-      # head, so purge all of them outright rather than only overwriting
-      # paths that also exist on master — a `git checkout <ref> -- <path>`
-      # restore leaves a PR-added file untouched, and this repository's
-      # master has no root GEMINI.md to restore in the first place.
-      - name: Remove untrusted agent-instruction surfaces
+      # A fork PR's own package.json scripts, Makefile, or repository
+      # tooling would otherwise run under Gemini CLI's headless execution
+      # with this job's secrets and pull-requests:write/issues:write
+      # permissions in scope; verify the PR's head repository is this
+      # repository's own before anything from its tree is used. (The
+      # pull_request trigger's `if:` above already guarantees this for that
+      # path; issue_comment's payload carries no head-repository field, so
+      # it needs this runtime check.)
+      - name: Verify the PR head is this repository's own branch
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          rm -rf .gemini .env .agents
-          find . -name 'GEMINI.md' -delete
-          git fetch origin master
-          git checkout origin/master -- .agents/ 2>/dev/null || true
+          pr_number=${{ github.event.pull_request.number || github.event.issue.number }}
+          head_repo_full=$(gh pr view "${pr_number}" --json headRepository --jq '.headRepository.nameWithOwner')
+          if [ "${head_repo_full}" != "${{ github.repository }}" ]; then
+            echo "::error::PR #${pr_number} head is an external fork (${head_repo_full}); gemini-pr-review does not check out fork content. Ask a maintainer to review it manually."
+            exit 1
+          fi
+
+      # .gemini/ and .env are stripped even though the checkout above is
+      # now verified to be this repository's own branch, guarding against a
+      # compromised or stale branch. .agents/ is deliberately left alone:
+      # a PR may legitimately be adding or editing skills and Agent Notes
+      # under it, and this job never commits, so there is nothing to
+      # protect against here beyond the collaborator gate already above.
+      - name: Remove untrusted workspace configuration
+        run: rm -rf .gemini .env
 
       # google-github-actions/run-gemini-cli's own env: block does not
       # reach the token into Gemini CLI's shell tool, which strips
       # GH_TOKEN/GITHUB_TOKEN from spawned subprocesses; authenticate gh
       # at the system level instead so `gh pr review`/`gh pr comment`
-      # keep working from inside the agent's shell calls.
+      # keep working from inside the agent's shell calls. setup-git wires
+      # the same credential into git itself, for any git operation beyond
+      # the push actions/checkout already configured a token for.
       - name: Authenticate GitHub CLI
-        run: echo "${{ github.token }}" | gh auth login --with-token
+        run: |
+          echo "${{ github.token }}" | gh auth login --with-token
+          gh auth setup-git
 
       - name: Run Gemini CLI review
         uses: google-github-actions/run-gemini-cli@v0
