@@ -15,10 +15,12 @@ concurrency:
 
 jobs:
   review:
-    # Fork pull_request runs never receive repository secrets, so an
-    # automatic review only makes sense against this repository's own
-    # branches; a fork PR still gets a review through the gated
-    # @gemini-cli /review comment path below.
+    # Fork pull_request runs never receive repository secrets, and the
+    # gated @gemini-cli /review comment path below is restricted to this
+    # repository's own branches too (see "Verify the PR head" below) since
+    # checking out a fork's tree would run its own scripts under Gemini
+    # CLI's headless execution; a fork PR's automated review is therefore
+    # unsupported either way and needs a maintainer's manual review.
     if: >-
       (github.event_name == 'pull_request' &&
        github.event.pull_request.head.repo.full_name == github.repository) ||
@@ -37,34 +39,39 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          # Check out the PR's actual head consistently for both trigger
-          # paths. github.ref for a pull_request event resolves to
-          # refs/pull/N/merge, which GitHub never generates for a PR with
-          # merge conflicts and which reviews a different tree than the
-          # head commit an issue_comment-triggered run inspects.
-          ref: >-
-            refs/pull/${{ github.event.pull_request.number ||
-                           github.event.issue.number }}/head
           fetch-depth: 0
 
       # A fork PR's own package.json scripts, Makefile, or repository
       # tooling would otherwise run under Gemini CLI's headless execution
       # with this job's secrets and pull-requests:write/issues:write
-      # permissions in scope; verify the PR's head repository is this
-      # repository's own before anything from its tree is used. (The
-      # pull_request trigger's `if:` above already guarantees this for that
-      # path; issue_comment's payload carries no head-repository field, so
-      # it needs this runtime check.)
+      # permissions in scope, so its head repository must be verified
+      # before anything from its tree is checked out — not merely before
+      # Gemini CLI runs. The pull_request trigger's `if:` above already
+      # guarantees this, so only the issue_comment path (whose payload
+      # carries no head-repository field) needs the runtime check.
       - name: Verify the PR head is this repository's own branch
+        if: ${{ github.event_name == 'issue_comment' }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          pr_number=${{ github.event.pull_request.number || github.event.issue.number }}
-          head_repo_full=$(gh pr view "${pr_number}" --json headRepository --jq '.headRepository.nameWithOwner')
+          head_repo_full=$(gh pr view "${{ github.event.issue.number }}" --json headRepository --jq '.headRepository.nameWithOwner')
           if [ "${head_repo_full}" != "${{ github.repository }}" ]; then
-            echo "::error::PR #${pr_number} head is an external fork (${head_repo_full}); gemini-pr-review does not check out fork content. Ask a maintainer to review it manually."
+            echo "::error::PR #${{ github.event.issue.number }} head is an external fork (${head_repo_full}); gemini-pr-review does not support reviewing fork content. Review it manually instead."
             exit 1
           fi
+
+      # Only reachable once the PR is known to be this repository's own
+      # branch (pull_request's `if:`, or the verification step above for
+      # issue_comment); checking out refs/pull/N/head here, rather than in
+      # the initial checkout, is what keeps an unverified fork's tree off
+      # disk in the first place. gh pr checkout resolves the same head
+      # commit for both trigger paths, unlike github.ref (refs/pull/N/merge
+      # for pull_request events), which GitHub never generates for a PR
+      # with merge conflicts.
+      - name: Check out the PR head
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh pr checkout ${{ github.event.pull_request.number || github.event.issue.number }}
 
       # .gemini/ and .env are stripped even though the checkout above is
       # now verified to be this repository's own branch, guarding against a
