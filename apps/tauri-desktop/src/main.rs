@@ -5,7 +5,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::env;
-use std::io::{BufRead, BufReader};
+use std::io::BufReader;
 use std::process::{Child, ChildStderr, ChildStdout, Command, ExitStatus, Stdio};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread;
@@ -21,15 +21,22 @@ use tauri::{AppHandle, Manager, State, WebviewUrl, WebviewWindowBuilder};
 const WEB_HOST: &str = "127.0.0.1";
 
 /// The wrapped `dsh web` child process, tracked through its lifecycle so a
-/// shutdown request racing with the still-in-flight spawn cannot leak it
-/// (see [`shutdown`]).
+/// shutdown request racing with the still-in-flight spawn, or with an
+/// already-in-flight termination, cannot leak it (see [`shutdown`] and
+/// [`stop_running_child`]).
 enum ChildSlot {
     /// `spawn_web_profile` has not returned yet.
     Pending,
     /// `dsh web` is running as this child.
     Running(Child),
-    /// Terminal: either `shutdown` has already run, or `spawn_web_profile`
-    /// itself failed (there was never a child to run).
+    /// `stop_running_child` has taken the child and is terminating it, but
+    /// has not finished yet. A concurrent caller must wait for this to
+    /// become `Stopped` rather than treating it as already done — the
+    /// child is still alive (or in the process of being force-killed) for
+    /// as long as this state holds.
+    Stopping,
+    /// Terminal: either termination finished, or `spawn_web_profile` itself
+    /// failed (there was never a child to run).
     Stopped,
 }
 
@@ -62,23 +69,30 @@ fn no_console_window(command: Command) -> Command {
 
 /// Locates the `dsh` launcher: `DSH_CLI_PATH` overrides discovery for
 /// packaging or development and is launched directly (it already names a
-/// concrete executable, extension included). Otherwise `dsh` is resolved
-/// from `PATH`, which is how an end-user install of the harness CLI is
-/// expected to be reached. On Windows that install is commonly an npm-style
-/// `dsh.cmd` shim, which `Command::new("dsh")` cannot find on its own (Rust
-/// does not apply `PATHEXT` the way `cmd.exe` does), so the fallback runs
-/// through `cmd /C`, which does.
-fn dsh_command() -> Command {
-    let command = if let Ok(path) = env::var("DSH_CLI_PATH") {
-        Command::new(path)
+/// concrete executable, extension included) — and, if set, is the only
+/// thing tried; a bad override is never silently retried against `PATH`.
+/// Otherwise `dsh` is resolved from `PATH`, which is how an end-user install
+/// of the harness CLI is expected to be reached. On Windows that install is
+/// commonly an npm-style `dsh.cmd` shim, which `Command::new("dsh")` cannot
+/// find on its own (Rust does not apply `PATHEXT` the way `cmd.exe` does),
+/// so the fallback runs through `cmd /C`, which does.
+///
+/// Returns the command alongside a description of what it actually attempted
+/// (naming the literal `DSH_CLI_PATH` value, or "PATH"), so a launch failure
+/// can report the real cause instead of a generic "checked X, then Y" that
+/// may not describe what happened for this particular launch.
+fn dsh_command() -> (Command, String) {
+    let (command, attempted) = if let Ok(path) = env::var("DSH_CLI_PATH") {
+        let attempted = format!("DSH_CLI_PATH={path}");
+        (Command::new(path), attempted)
     } else if cfg!(target_os = "windows") {
         let mut command = Command::new("cmd");
         command.args(["/C", "dsh"]);
-        command
+        (command, "`dsh` on PATH".to_string())
     } else {
-        Command::new("dsh")
+        (Command::new("dsh"), "`dsh` on PATH".to_string())
     };
-    no_console_window(command)
+    (no_console_window(command), attempted)
 }
 
 /// Resolves the working directory `dsh web` should run in: `DSH_WEB_WORKSPACE`
@@ -110,8 +124,11 @@ fn workspace_dir() -> Option<String> {
 /// cause to stderr — this shell's packaged Windows release has no console
 /// to show either stream in otherwise, so both are read back and surfaced
 /// in the window instead. Stdin is discarded.
-fn spawn_web_profile(port: &str) -> std::io::Result<Child> {
-    let mut command = dsh_command();
+///
+/// Returns the description from [`dsh_command`] alongside the spawn result,
+/// so a failure can be reported against what was actually attempted.
+fn spawn_web_profile(port: &str) -> (std::io::Result<Child>, String) {
+    let (mut command, attempted) = dsh_command();
     command
         .args(["--profile", "web", "--host", WEB_HOST, "--port", port, "--no-open"])
         .stdin(Stdio::null())
@@ -120,7 +137,7 @@ fn spawn_web_profile(port: &str) -> std::io::Result<Child> {
     if let Some(dir) = workspace_dir() {
         command.current_dir(dir);
     }
-    command.spawn()
+    (command.spawn(), attempted)
 }
 
 /// Extracts the authenticated URL from a `dsh web` readiness line
@@ -179,13 +196,43 @@ fn spawn_stderr_capture(stderr: ChildStderr) -> (Arc<Mutex<Vec<u8>>>, mpsc::Rece
 /// a stronger readiness signal than a TCP connect: it is only ever printed
 /// by this exact child once its own server has bound, so it cannot be
 /// satisfied by an unrelated process already occupying the port.
+///
+/// The reader thread this spawns keeps running (draining and discarding
+/// stdout) for the rest of the child's life, well past finding the URL and
+/// returning it here: any Web plugin can still write to stdout afterward
+/// (`cordis-host-runner` forwards extension logging to it), and dropping the
+/// last reader for `ChildStdout` would close this shell's end of that pipe,
+/// risking an `EPIPE` on the next such write. That drain is also
+/// line-length-bounded, not just bounded in total: an unterminated stdout
+/// record longer than a plausible readiness line is discarded as it grows,
+/// rather than buffered without limit the way `BufRead::lines()` would.
 fn wait_for_ready_url(profile: &WebProfile, stdout: ChildStdout, timeout: Duration) -> Option<String> {
+    const MAX_LINE_BYTES: usize = 4096;
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
-        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-            if let Some(url) = parse_ready_url(&line) {
-                let _ = tx.send(url);
-                return;
+        let mut reader = BufReader::new(stdout);
+        let mut line = Vec::new();
+        let mut byte = [0u8; 1];
+        let mut found = false;
+        loop {
+            match std::io::Read::read(&mut reader, &mut byte) {
+                Ok(0) | Err(_) => break,
+                Ok(_) if byte[0] == b'\n' => {
+                    if !found {
+                        if let Ok(text) = std::str::from_utf8(&line) {
+                            if let Some(url) = parse_ready_url(text.trim_end_matches('\r')) {
+                                found = tx.send(url).is_ok();
+                            }
+                        }
+                    }
+                    line.clear();
+                }
+                Ok(_) => {
+                    line.push(byte[0]);
+                    if line.len() > MAX_LINE_BYTES {
+                        line.clear();
+                    }
+                }
             }
         }
     });
@@ -225,10 +272,26 @@ fn wait_for_exit(child: &mut Child, timeout: Duration) -> Option<ExitStatus> {
     None
 }
 
-/// Stops `child` and waits for it to exit: a graceful request first
-/// (`SIGTERM` on Unix, `taskkill` without `/F` on Windows), giving it 5s to
-/// exit — so the CLI can run its normal shutdown path (flushing
-/// Session/storage state) — before escalating to a forced, whole-tree kill.
+/// Stops `child` and waits for it to exit.
+///
+/// On Unix, tries a graceful `SIGTERM` first, giving it 5s to exit — so the
+/// CLI can run its normal shutdown path (flushing Session/storage state) —
+/// before escalating to `SIGKILL`.
+///
+/// On Windows there is no such graceful step: this repository's own
+/// documented Windows process semantics
+/// (`packages/subprocess/subprocess-local/README.md`) record that "a
+/// `taskkill` without `/F` does not terminate console processes", which is
+/// exactly what `dsh` and its `cmd.exe` wrapper are — so a non-forced
+/// `taskkill` here would not deliver anything the CLI's own `SIGTERM`/`SIGINT`
+/// handlers (`apps/cli/src/profile-boot.ts`) could act on. Actually reaching
+/// those handlers needs the same console-signal machinery that package
+/// already implements carefully (writing a literal Ctrl-C byte into the
+/// target's own console input, not a generic Win32 API call); reimplementing
+/// that here, untested, in an experimental shell risked getting it subtly
+/// wrong with no way to verify it. Going straight to a forced, whole-tree
+/// `taskkill /F` is honest about that gap instead of waiting out a 5s grace
+/// period that was never actually requesting anything.
 ///
 /// Checks `try_wait()` before signaling at all: on Unix, an exit status
 /// already observed by [`wait_for_ready_url`]'s polling means the process
@@ -238,8 +301,7 @@ fn wait_for_exit(child: &mut Child, timeout: Duration) -> Option<ExitStatus> {
 /// On Windows, `dsh` is launched through `cmd /C` (see `dsh_command`), so
 /// `child` is `cmd.exe`, not the Node process it starts in turn; killing
 /// only that direct child would leak the Node process and its bound port.
-/// `taskkill /T` targets the whole process tree instead, both here and in
-/// the escalation.
+/// `taskkill /T` targets the whole process tree instead.
 fn terminate(mut child: Child) {
     match child.try_wait() {
         Ok(Some(_)) => return,
@@ -248,20 +310,15 @@ fn terminate(mut child: Child) {
     }
 
     if cfg!(target_os = "windows") {
-        let _ = no_console_window(Command::new("taskkill")).arg("/PID").arg(child.id().to_string()).arg("/T").status();
+        let _ = no_console_window(Command::new("taskkill"))
+            .arg("/PID")
+            .arg(child.id().to_string())
+            .arg("/T")
+            .arg("/F")
+            .status();
     } else {
         let _ = Command::new("kill").arg("-TERM").arg(child.id().to_string()).status();
-    }
-
-    if wait_for_exit(&mut child, Duration::from_secs(5)).is_none() {
-        if cfg!(target_os = "windows") {
-            let _ = no_console_window(Command::new("taskkill"))
-                .arg("/PID")
-                .arg(child.id().to_string())
-                .arg("/T")
-                .arg("/F")
-                .status();
-        } else {
+        if wait_for_exit(&mut child, Duration::from_secs(5)).is_none() {
             let _ = child.kill();
         }
     }
@@ -303,6 +360,41 @@ fn record_spawn_outcome(profile: &WebProfile, child: Option<Child>) -> bool {
     accepted
 }
 
+/// Takes whatever child is currently `Running` (if any) and terminates it,
+/// holding the slot at [`ChildSlot::Stopping`] for the duration rather than
+/// jumping straight to `Stopped`. Without that intermediate state, a
+/// concurrent caller — `shutdown`, or another `stop_running_child` call from
+/// a different failure path — could see `Stopped` and return as if nothing
+/// were left to do while this call's `terminate` was still in flight (still
+/// waiting out its own grace period, say), and the app could then exit
+/// before that `terminate` actually finished.
+///
+/// Only the caller that actually finds and takes a `Running` child performs
+/// the termination and the final `Stopped` write; any other concurrent
+/// caller either waits here for that to finish (if it finds `Stopping`) or
+/// returns immediately (if it finds `Pending` — nothing has been spawned yet,
+/// not this function's concern — or already `Stopped`).
+fn stop_running_child(profile: &WebProfile) {
+    let mut guard = profile.child.lock().expect("web profile mutex poisoned");
+    loop {
+        match &*guard {
+            ChildSlot::Running(_) => break,
+            ChildSlot::Stopping => {
+                guard = profile.child_ready.wait(guard).expect("web profile mutex poisoned");
+            }
+            ChildSlot::Pending | ChildSlot::Stopped => return,
+        }
+    }
+    let previous = std::mem::replace(&mut *guard, ChildSlot::Stopping);
+    drop(guard);
+    profile.child_ready.notify_all();
+    if let ChildSlot::Running(child) = previous {
+        terminate(child);
+    }
+    *profile.child.lock().expect("web profile mutex poisoned") = ChildSlot::Stopped;
+    profile.child_ready.notify_all();
+}
+
 /// Stops the wrapped `dsh web` process, if one is running, was still
 /// spawning, or never got the chance to (in which case there is nothing to
 /// do beyond marking the slot terminal). Called on window close and on app
@@ -326,15 +418,13 @@ fn record_spawn_outcome(profile: &WebProfile, child: Option<Child>) -> bool {
 /// is an accepted cost for never returning "stopped" while that may not yet
 /// be true.
 fn shutdown(profile: &State<WebProfile>) {
-    let mut guard = profile.child.lock().expect("web profile mutex poisoned");
-    while matches!(*guard, ChildSlot::Pending) {
-        guard = profile.child_ready.wait(guard).expect("web profile mutex poisoned");
+    {
+        let mut guard = profile.child.lock().expect("web profile mutex poisoned");
+        while matches!(*guard, ChildSlot::Pending) {
+            guard = profile.child_ready.wait(guard).expect("web profile mutex poisoned");
+        }
     }
-    let previous = std::mem::replace(&mut *guard, ChildSlot::Stopped);
-    drop(guard);
-    if let ChildSlot::Running(child) = previous {
-        terminate(child);
-    }
+    stop_running_child(profile);
 }
 
 const LOADING_HTML: &str = "data:text/html;charset=utf-8,\
@@ -458,7 +548,8 @@ fn main() {
             let handle: AppHandle = app.handle().clone();
             thread::spawn(move || {
                 let profile = handle.state::<WebProfile>();
-                let url = match spawn_web_profile(&port) {
+                let (spawned, attempted) = spawn_web_profile(&port);
+                let url = match spawned {
                     Ok(mut child) => {
                         let stdout = child.stdout.take().expect("spawn_web_profile pipes stdout");
                         let stderr = child.stderr.take().expect("spawn_web_profile pipes stderr");
@@ -481,22 +572,14 @@ fn main() {
                                 // to ever reach it — a URL announced after
                                 // this point would have nowhere to go, since
                                 // nothing is still reading stdout for it.
-                                let previous = std::mem::replace(
-                                    &mut *profile.child.lock().expect("web profile mutex poisoned"),
-                                    ChildSlot::Stopped,
-                                );
-                                if let ChildSlot::Running(child) = previous {
-                                    terminate(child);
-                                }
+                                stop_running_child(&profile);
                                 startup_failure_page(&captured_stderr, &stderr_done)
                             }
                         }
                     }
                     Err(error) => {
                         record_spawn_outcome(&profile, None);
-                        message_page(&format!(
-                            "failed to launch `dsh --profile web` (checked DSH_CLI_PATH, then PATH): {error}"
-                        ))
+                        message_page(&format!("failed to launch dsh --profile web ({attempted}): {error}"))
                     }
                 };
                 if let Some(window) = handle.get_webview_window("main") {

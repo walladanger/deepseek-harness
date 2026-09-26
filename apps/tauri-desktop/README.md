@@ -41,15 +41,23 @@ If `dsh web` exits without ever announcing that URL, the window instead
 shows whatever it wrote to stderr (its own actionable cause), falling back
 to a generic timeout message if it wrote nothing.
 
-On window close or app exit, the shell asks the child to stop gracefully
-(`SIGTERM` on Unix, `taskkill` without `/F` on Windows) and gives it 5s to
-exit — so the CLI can run its normal shutdown path — before force-killing
-it. On Windows the child is `cmd.exe` (see below), so termination targets
-its whole process tree (`taskkill /T`), not just that one process. A
-shutdown request that arrives while `dsh` is still in the process of
-spawning blocks (briefly, bounded) until that spawn resolves, rather than
-finding nothing yet to stop and returning while a child could still end up
-running unmanaged.
+On window close or app exit, the shell stops the child. On Unix that's a
+graceful `SIGTERM` first, with 5s to exit — so the CLI can run its normal
+shutdown path — before escalating to `SIGKILL`. On Windows there is no
+graceful step: `dsh` and its `cmd.exe` wrapper are console processes, and
+`taskkill` without `/F` does not terminate those (a fact this repository's
+own `packages/subprocess/subprocess-local` records and works around with
+Windows console-signal machinery this shell does not reimplement), so it
+goes straight to a forced, whole-tree `taskkill /T /F`.
+
+A shutdown request that arrives while `dsh` is still in the process of
+spawning, or while an earlier shutdown/timeout path is still in the middle
+of stopping it, blocks until that resolves rather than finding nothing yet
+to do and returning while the child could still end up running unmanaged.
+That wait is deliberately unbounded: an unresponsive `DSH_CLI_PATH` (a stuck
+UNC path, say) could in principle block the app from closing for as long as
+the underlying `Command::spawn()` call takes to fail, rather than for any
+fixed bound.
 
 ## Known limitations
 
