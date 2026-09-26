@@ -186,33 +186,40 @@ fn spawn_web_profile(port: &str) -> (std::io::Result<Child>, String) {
 /// cannot know in advance in that case. Every other `expected_port` must
 /// match exactly.
 ///
-/// Validating the authority this way (not just parsing generically) serves
-/// two purposes at once: it rejects a same-looking line some other process
-/// output could coincidentally produce, since only `dsh web` itself would
-/// ever announce exactly this shell's own host and (fixed) port; and,
-/// because the match requires an exact `http://<host>:<port>` prefix, a
-/// malformed candidate (a stray `[` breaking the authority, say) can never
-/// pass, which is what protects `window.navigate`'s own parse from having
-/// to handle one at all.
+/// Validating the authority this way (not just checking it looks like an
+/// HTTP(S) URL) rejects a same-looking line some other process output could
+/// coincidentally produce, since only `dsh web` itself would ever announce
+/// exactly this shell's own host, (fixed) port, and process token.
+///
+/// Parses `candidate` with a real URL parser rather than matching an
+/// `http://<host>:<port>` string prefix: a prefix match cannot tell
+/// authority syntax apart from a look-alike, so
+/// `http://127.0.0.1:5175@evil.example/?token=x` would pass a prefix check
+/// (it does start with `http://127.0.0.1:5175`) while actually parsing to
+/// host `evil.example`, port 80, with `127.0.0.1:5175` as discarded
+/// userinfo — exactly the authority confusion this validation exists to
+/// prevent. Rejecting nonempty userinfo outright closes that gap since
+/// `dsh web` itself never announces any.
 fn parse_ready_url(line: &str, expected_port: &str) -> Option<String> {
     let candidate = line.strip_prefix("dsh web: ")?.split_whitespace().next()?;
-    let after_host = candidate.strip_prefix(&format!("http://{WEB_HOST}:"))?;
-    let announced_port_len = after_host.find(|c: char| !c.is_ascii_digit()).unwrap_or(after_host.len());
-    let (announced_port, rest) = after_host.split_at(announced_port_len);
-    if announced_port.is_empty() || (expected_port != "0" && announced_port != expected_port) {
+    let url = tauri::Url::parse(candidate).ok()?;
+    if url.scheme() != "http" || url.host_str() != Some(WEB_HOST) || !url.username().is_empty() || url.password().is_some()
+    {
         return None;
     }
-    // Requires a nonempty `token` query value, not just a `?`-prefixed rest:
-    // `packages/client/connection/src/browser-auth.ts`'s `authenticatedUrl`
-    // always sets exactly this query parameter on the real announcement, and
-    // the bare index route 401s without it. Accepting any `?`-prefixed (or
-    // empty/path-only) rest would let a same-looking but unauthenticated line
-    // — printed by some other startup plugin before the real announcement,
+    let announced_port = url.port()?;
+    if expected_port != "0" && announced_port.to_string() != expected_port {
+        return None;
+    }
+    // Requires a nonempty `token` query value: `authenticatedUrl` in
+    // `packages/client/connection/src/browser-auth.ts` always sets exactly
+    // this query parameter on the real announcement, and the bare index
+    // route 401s without it. Accepting any matching authority regardless of
+    // its query would let a same-looking but unauthenticated line —
+    // printed by some other startup plugin before the real announcement,
     // say — be mistaken for readiness, latching the window onto a URL that
     // can never load, with the real announcement then discarded unread.
-    rest.split('?').nth(1)?.split('&').any(|pair| {
-        pair.strip_prefix("token=").is_some_and(|value| !value.is_empty())
-    }).then(|| candidate.to_string())
+    url.query_pairs().any(|(key, value)| key == "token" && !value.is_empty()).then(|| candidate.to_string())
 }
 
 /// Reads `stderr` on a dedicated thread into a bounded buffer, returning a
@@ -658,25 +665,33 @@ fn startup_failure_page(captured_stderr: &Mutex<Vec<u8>>, stderr_done: &mpsc::Re
 /// group so a whole-group signal in [`terminate`] cannot also hit this
 /// shell, `dsh` does not receive the terminal's Ctrl-C/SIGINT either, and
 /// would keep running, bound to its port, after this process is gone.
+///
+/// Propagates registration failure (an exhausted file-descriptor table,
+/// say) to the caller rather than silently continuing without this
+/// protection: `dsh` is about to be spawned outside this process's group
+/// specifically because [`terminate`]'s whole-group signaling depends on
+/// that separation, so a Ctrl-C or `SIGTERM` arriving before registration
+/// succeeds would otherwise kill only this shell and leave `dsh` running,
+/// bound to its port, with nothing left tracking it.
 #[cfg(unix)]
-fn install_unix_signal_shutdown(handle: AppHandle) {
+fn install_unix_signal_shutdown(handle: AppHandle) -> std::io::Result<()> {
     use signal_hook::consts::{SIGINT, SIGTERM};
     use signal_hook::iterator::Signals;
 
-    let mut signals = match Signals::new([SIGINT, SIGTERM]) {
-        Ok(signals) => signals,
-        Err(_) => return,
-    };
+    let mut signals = Signals::new([SIGINT, SIGTERM])?;
     thread::spawn(move || {
         if signals.forever().next().is_some() {
             shutdown(&handle.state::<WebProfile>());
             std::process::exit(0);
         }
     });
+    Ok(())
 }
 
 #[cfg(not(unix))]
-fn install_unix_signal_shutdown(_handle: AppHandle) {}
+fn install_unix_signal_shutdown(_handle: AppHandle) -> std::io::Result<()> {
+    Ok(())
+}
 
 /// Opens `url` in the platform's default browser, the same way clicking an
 /// external link in [`apps/desktop`'s Electron shell](../../desktop) does
@@ -685,10 +700,14 @@ fn install_unix_signal_shutdown(_handle: AppHandle) {}
 /// rather than pulling in a plugin for a one-line, non-configurable action.
 fn open_in_system_browser(url: &str) {
     let result = if cfg!(target_os = "windows") {
-        // `start`'s first argument is its (optional, quoted) window title,
-        // not part of the target; an empty title argument is required so
-        // `url` itself isn't misread as one.
-        no_console_window(Command::new("cmd")).arg("/C").arg("start").arg("").arg(url).status()
+        // Not `cmd /C start "" <url>`: `cmd.exe` re-parses its own command
+        // line for its own metacharacters (`&`, `|`, ...) regardless of how
+        // the argument was passed to it, so a URL a page's own link or
+        // `window.open()` supplies (an ordinary query string can contain
+        // any of them) could inject a second command. `rundll32` calls the
+        // shell's URL-opening entry point directly, with no command
+        // interpreter in between to reinterpret `url` at all.
+        no_console_window(Command::new("rundll32")).arg("url.dll,FileProtocolHandler").arg(url).status()
     } else if cfg!(target_os = "macos") {
         Command::new("open").arg(url).status()
     } else {
@@ -761,7 +780,7 @@ fn main() {
                 })
                 .build()?;
 
-            install_unix_signal_shutdown(app.handle().clone());
+            install_unix_signal_shutdown(app.handle().clone())?;
 
             let handle: AppHandle = app.handle().clone();
             thread::spawn(move || {
