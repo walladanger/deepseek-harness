@@ -31,8 +31,8 @@
 .PARAMETER Stop
     Close a running dsh-tauri-desktop.exe instance's window instead of
     starting one. This triggers the shell's own close handling, which stops
-    the wrapped `dsh` process; if the window does not close within 10s, the
-    process is force-stopped as a fallback.
+    the wrapped `dsh` process; if the window does not close within 10s, its
+    whole process tree is force-stopped as a fallback.
 
 .EXAMPLE
     .\Run-DshDesktop.ps1
@@ -71,8 +71,12 @@ if ($Stop) {
     $exited = $running | Wait-Process -Timeout 10 -ErrorAction SilentlyContinue
     $stillRunning = Get-Process -Name $processName -ErrorAction SilentlyContinue
     if ($stillRunning) {
-        Write-Warning "$processName did not close within 10s; force-stopping (its dsh child may be left running)."
-        $stillRunning | Stop-Process -Force
+        Write-Warning "$processName did not close within 10s; force-stopping its process tree."
+        foreach ($process in $stillRunning) {
+            # taskkill /T kills the shell's own dsh/cmd.exe/node subtree too;
+            # Stop-Process -Force would kill only the shell itself and leak them.
+            & taskkill.exe /PID $process.Id /T /F | Out-Null
+        }
     }
     Write-Host "Stopped $processName."
     exit 0
@@ -110,4 +114,4 @@ if ($DshCliPath) {
 }
 
 Start-Process -FilePath $ExePath
-Write-Host "Started $processName (web profile at http://${WebHost}:${Port})."
+Write-Host "Started $processName (web profile bound to ${WebHost}:${Port}; the shell navigates its own window to dsh web's announced, authenticated URL)."
