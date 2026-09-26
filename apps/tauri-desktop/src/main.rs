@@ -89,15 +89,52 @@ fn own_process_group(command: Command) -> Command {
     command
 }
 
+/// Searches `PATH` (this process's own environment, not the child's) for a
+/// `dsh` launcher, checking each directory for `dsh.exe`, `dsh.cmd`,
+/// `dsh.bat`, then bare `dsh`, and returning the first match's full path.
+/// `None` if `PATH` is unset or unset a nothing named `dsh` in any of its
+/// directories.
+///
+/// Resolving `PATH` this way, before the child's own working directory is
+/// ever set, and launching the concrete result rather than a bare `dsh`
+/// name closes a lookup-order hazard: `cmd.exe` resolves an unqualified
+/// command name by searching its *own* current directory before `PATH`
+/// ([documented](https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/where)),
+/// and that current directory is `workspace_dir()` — `DSH_WEB_WORKSPACE`, an
+/// arbitrary user-chosen directory. A `dsh.cmd` planted there would run
+/// instead of the real one on `PATH`, silently, at every startup. An
+/// already-fully-qualified path given to `cmd /C` is run as-is, with no
+/// command-name search at all.
+#[cfg(windows)]
+fn resolve_dsh_on_path() -> Option<std::path::PathBuf> {
+    let path_var = env::var_os("PATH")?;
+    const EXTENSIONS: &[&str] = &["exe", "cmd", "bat", ""];
+    for dir in env::split_paths(&path_var) {
+        for ext in EXTENSIONS {
+            let candidate = if ext.is_empty() { dir.join("dsh") } else { dir.join(format!("dsh.{ext}")) };
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
 /// Locates the `dsh` launcher: `DSH_CLI_PATH` overrides discovery for
 /// packaging or development and is launched directly (it already names a
 /// concrete executable, extension included) — and, if set, is the only
 /// thing tried; a bad override is never silently retried against `PATH`.
 /// Otherwise `dsh` is resolved from `PATH`, which is how an end-user install
 /// of the harness CLI is expected to be reached. On Windows that install is
-/// commonly an npm-style `dsh.cmd` shim, which `Command::new("dsh")` cannot
-/// find on its own (Rust does not apply `PATHEXT` the way `cmd.exe` does),
-/// so the fallback runs through `cmd /C`, which does.
+/// commonly an npm-style `dsh.cmd` shim: [`resolve_dsh_on_path`] finds its
+/// concrete path (`Command::new("dsh")` cannot, since Rust does not apply
+/// `PATHEXT` the way `cmd.exe` does), and a `.cmd`/`.bat` result still runs
+/// through `cmd /C`, which can execute a script file directly but not a
+/// bare native binary — a resolved `.exe` (or an extensionless PATH entry)
+/// is instead run directly, with no `cmd.exe` involved at all. If `PATH`
+/// search itself turns up nothing, falls back to the previous unqualified
+/// `cmd /C dsh` (this is no *more* exposed to the lookup-order hazard above
+/// than not finding `dsh` at all already was).
 ///
 /// Returns the command alongside a description of what it actually attempted
 /// (naming the literal `DSH_CLI_PATH` value, or "PATH"), so a launch failure
@@ -119,14 +156,39 @@ fn dsh_command() -> (Command, String) {
             env::current_dir().map(|cwd| cwd.join(resolved).to_string_lossy().into_owned()).unwrap_or(path)
         };
         (Command::new(program), attempted)
-    } else if cfg!(target_os = "windows") {
-        let mut command = Command::new("cmd");
-        command.args(["/C", "dsh"]);
-        (command, "`dsh` on PATH".to_string())
     } else {
-        (Command::new("dsh"), "`dsh` on PATH".to_string())
+        dsh_on_path_command()
     };
     (own_process_group(no_console_window(command)), attempted)
+}
+
+#[cfg(windows)]
+fn dsh_on_path_command() -> (Command, String) {
+    match resolve_dsh_on_path() {
+        Some(resolved) => {
+            let attempted = format!("`dsh` on PATH ({})", resolved.display());
+            let is_script =
+                resolved.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat"));
+            let command = if is_script {
+                let mut command = Command::new("cmd");
+                command.arg("/C").arg(&resolved);
+                command
+            } else {
+                Command::new(&resolved)
+            };
+            (command, attempted)
+        }
+        None => {
+            let mut command = Command::new("cmd");
+            command.args(["/C", "dsh"]);
+            (command, "`dsh` on PATH".to_string())
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn dsh_on_path_command() -> (Command, String) {
+    (Command::new("dsh"), "`dsh` on PATH".to_string())
 }
 
 /// Resolves the working directory `dsh web` should run in: `DSH_WEB_WORKSPACE`
@@ -207,19 +269,37 @@ fn parse_ready_url(line: &str, expected_port: &str) -> Option<String> {
     {
         return None;
     }
-    let announced_port = url.port()?;
-    if expected_port != "0" && announced_port.to_string() != expected_port {
+    // Compares numeric values, not the two sides' original text: dsh web
+    // accepts `DSH_WEB_PORT` as raw digit text and converts it with
+    // `Number(...)` (`packages/bundle/web-app/src/startup.ts`), so a
+    // noncanonical value such as "08080" would announce as "8080" and never
+    // match its own request under a string comparison. `port_or_known_default`
+    // (not `port`) also covers an explicit port 80, which the URL parser
+    // normalizes away as http's own default and `port()` would report as
+    // `None`. Every numeric zero form (`"0"`, `"00"`, ...) of `expected_port`
+    // is `dsh web`'s own "let the OS allocate a free port" value, matching
+    // any announced port since this shell cannot know that one in advance.
+    let announced_port = u32::from(url.port_or_known_default()?);
+    let expected_numeric: u32 = expected_port.trim().parse().ok()?;
+    if expected_numeric != 0 && announced_port != expected_numeric {
         return None;
     }
-    // Requires a nonempty `token` query value: `authenticatedUrl` in
-    // `packages/client/connection/src/browser-auth.ts` always sets exactly
-    // this query parameter on the real announcement, and the bare index
-    // route 401s without it. Accepting any matching authority regardless of
-    // its query would let a same-looking but unauthenticated line —
-    // printed by some other startup plugin before the real announcement,
-    // say — be mistaken for readiness, latching the window onto a URL that
-    // can never load, with the real announcement then discarded unread.
-    url.query_pairs().any(|(key, value)| key == "token" && !value.is_empty()).then(|| candidate.to_string())
+    // Requires the exact root path and exactly one nonempty `token` query
+    // value, matching `BrowserAuth.authorizeIndex` in
+    // `packages/client/connection/src/browser-auth.ts` exactly: it accepts
+    // the launch token only at pathname `/` with exactly one `token` pair,
+    // rejecting a different path or more than one token with 401/404.
+    // Accepting a broader match here would let a same-looking but rejected
+    // URL — printed by some other startup plugin before the real
+    // announcement, say — be mistaken for readiness, latching the window
+    // onto a URL that can never load, with the real announcement then
+    // discarded unread.
+    if url.path() != "/" {
+        return None;
+    }
+    let mut tokens = url.query_pairs().filter(|(key, _)| key == "token");
+    let only_token = tokens.next().filter(|_| tokens.next().is_none());
+    only_token.is_some_and(|(_, value)| !value.is_empty()).then(|| candidate.to_string())
 }
 
 /// Reads `stderr` on a dedicated thread into a bounded buffer, returning a
@@ -698,7 +778,19 @@ fn install_unix_signal_shutdown(_handle: AppHandle) -> std::io::Result<()> {
 /// via Electron's `shell.openExternal`. No equivalent exists inside a bare
 /// webview, so this shells out to each platform's own opener directly
 /// rather than pulling in a plugin for a one-line, non-configurable action.
-fn open_in_system_browser(url: &str) {
+/// Opens `url` if — and only if — it is `http://` or `https://`, matching
+/// what `apps/desktop`'s Electron shell itself restricts external handoff
+/// to (`apps/desktop/src/main.ts`). Without this, a `file:` link or a
+/// registered custom-protocol URL from dsh's own web content (a chat
+/// citation, an account-authorization link) would be handed to the
+/// platform opener just the same as an `http(s)` one, which can launch a
+/// local file handler or an arbitrary installed application instead of a
+/// browser.
+fn open_in_system_browser(url: &tauri::Url) {
+    if url.scheme() != "http" && url.scheme() != "https" {
+        return;
+    }
+    let url = url.as_str();
     let result = if cfg!(target_os = "windows") {
         // Not `cmd /C start "" <url>`: `cmd.exe` re-parses its own command
         // line for its own metacharacters (`&`, `|`, ...) regardless of how
@@ -766,7 +858,7 @@ fn main() {
                     if should_load_in_window(url, &navigation_origin) {
                         true
                     } else {
-                        open_in_system_browser(url.as_str());
+                        open_in_system_browser(url);
                         false
                     }
                 })
@@ -775,7 +867,7 @@ fn main() {
                 // request a *new* window rather than navigating this one,
                 // so `on_navigation` above never sees them.
                 .on_new_window(move |url, _features| {
-                    open_in_system_browser(url.as_str());
+                    open_in_system_browser(&url);
                     tauri::webview::NewWindowResponse::Deny
                 })
                 .build()?;
@@ -841,6 +933,20 @@ fn main() {
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { .. } = event {
                 shutdown(&window.state::<WebProfile>());
+                // Quits the whole process here rather than letting the
+                // window merely close: macOS's own default keeps an app
+                // resident with no window after its last one closes,
+                // expecting an `activate`/reopen handler to bring a window
+                // back. This shell has none — recreating the window would
+                // also mean re-spawning and re-navigating to a fresh `dsh
+                // web` from scratch — so left to that default it would sit
+                // resident with `dsh` already stopped and no way back short
+                // of a fresh launch, which itself would be swallowed by
+                // `tauri-plugin-single-instance` finding no `main` window
+                // and doing nothing. Exiting on close, uniformly across
+                // platforms, matches this shell's single-window design: one
+                // launch is one `dsh web` session, start to finish.
+                std::process::exit(0);
             }
         })
         .build(tauri::generate_context!())

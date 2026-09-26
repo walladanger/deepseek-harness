@@ -41,6 +41,11 @@ If `dsh web` exits without ever announcing that URL, the window instead
 shows whatever it wrote to stderr (its own actionable cause), falling back
 to a generic timeout message if it wrote nothing.
 
+Closing the window quits the whole process, on every platform (including
+macOS, where an app would otherwise stay resident with no window after its
+last one closes) — one launch is one `dsh web` session, start to finish;
+there is no reopen/recreate-the-window path.
+
 On window close or app exit, the shell stops the child. On Unix that's a
 graceful `SIGTERM` first, with 5s to exit — so the CLI can run its normal
 shutdown path — before escalating to `SIGKILL`. On Windows there is no
@@ -71,7 +76,10 @@ A link within the dsh UI that targets somewhere outside its own origin — an
 account-authorization link, a chat citation — opens in the platform's
 default browser instead of navigating this window away from the app or
 opening a second in-app window, the same disposition `apps/desktop`'s
-Electron shell gives such links.
+Electron shell gives such links. Only `http://`/`https://` targets are
+handed to the system opener; anything else (a `file:` link, a registered
+custom-protocol URL) is denied outright rather than risk launching a local
+file handler or an arbitrary installed application.
 
 ## Known limitations
 
