@@ -67,6 +67,28 @@ fn no_console_window(command: Command) -> Command {
     command
 }
 
+/// Puts `dsh` in a new process group led by its own PID, rather than this
+/// shell's. `dsh` (Node) can itself own detached descendants — a Web
+/// session's tool or plugin subprocesses — that only `dsh`'s own graceful
+/// `SIGTERM` disposal path stops; if that grace period is exceeded and
+/// `terminate` escalates to a forced kill, signaling only `dsh`'s own PID
+/// would leave any such descendants running with no process left to dispose
+/// of them. Signaling the whole group (a negative PID, in
+/// [`terminate`]) reaches them directly regardless. A no-op on Windows,
+/// where process groups work differently and `dsh` is anyway reached
+/// through the whole-tree `taskkill /T`.
+#[cfg(unix)]
+fn own_process_group(mut command: Command) -> Command {
+    use std::os::unix::process::CommandExt;
+    command.process_group(0);
+    command
+}
+
+#[cfg(not(unix))]
+fn own_process_group(command: Command) -> Command {
+    command
+}
+
 /// Locates the `dsh` launcher: `DSH_CLI_PATH` overrides discovery for
 /// packaging or development and is launched directly (it already names a
 /// concrete executable, extension included) — and, if set, is the only
@@ -92,7 +114,7 @@ fn dsh_command() -> (Command, String) {
     } else {
         (Command::new("dsh"), "`dsh` on PATH".to_string())
     };
-    (no_console_window(command), attempted)
+    (own_process_group(no_console_window(command)), attempted)
 }
 
 /// Resolves the working directory `dsh web` should run in: `DSH_WEB_WORKSPACE`
@@ -141,11 +163,24 @@ fn spawn_web_profile(port: &str) -> (std::io::Result<Child>, String) {
 }
 
 /// Extracts the authenticated URL from a `dsh web` readiness line
-/// (`"dsh web: <url>"`, optionally followed by `" (LAN: <url>)"`), or
-/// `None` if `line` is not that announcement.
-fn parse_ready_url(line: &str) -> Option<String> {
-    let url = line.strip_prefix("dsh web: ")?.split_whitespace().next()?;
-    (url.starts_with("http://") || url.starts_with("https://")).then(|| url.to_string())
+/// (`"dsh web: <url>"`, optionally followed by `" (LAN: <url>)"`), verifying
+/// it actually names this shell's own [`WEB_HOST`]:`expected_port` rather
+/// than merely looking like an HTTP(S) URL. `None` if `line` is not that
+/// announcement, or the candidate URL doesn't match.
+///
+/// Validating the authority (not just parsing generically) serves two
+/// purposes at once: it rejects a same-looking line some other process
+/// output could coincidentally produce, since only `dsh web` itself would
+/// ever announce exactly this shell's own host and port; and, because the
+/// match requires an exact `http://<host>:<port>` prefix, a malformed
+/// candidate (a stray `[` breaking the authority, say) can never pass,
+/// which is what protected `window.navigate`'s own parse from having to
+/// handle one at all.
+fn parse_ready_url(line: &str, expected_port: &str) -> Option<String> {
+    let candidate = line.strip_prefix("dsh web: ")?.split_whitespace().next()?;
+    let expected_origin = format!("http://{WEB_HOST}:{expected_port}");
+    let rest = candidate.strip_prefix(&expected_origin)?;
+    (rest.is_empty() || rest.starts_with('/') || rest.starts_with('?')).then(|| candidate.to_string())
 }
 
 /// Reads `stderr` on a dedicated thread into a bounded buffer, returning a
@@ -206,31 +241,42 @@ fn spawn_stderr_capture(stderr: ChildStderr) -> (Arc<Mutex<Vec<u8>>>, mpsc::Rece
 /// line-length-bounded, not just bounded in total: an unterminated stdout
 /// record longer than a plausible readiness line is discarded as it grows,
 /// rather than buffered without limit the way `BufRead::lines()` would.
-fn wait_for_ready_url(profile: &WebProfile, stdout: ChildStdout, timeout: Duration) -> Option<String> {
+fn wait_for_ready_url(profile: &WebProfile, stdout: ChildStdout, port: &str, timeout: Duration) -> Option<String> {
     const MAX_LINE_BYTES: usize = 4096;
     let (tx, rx) = mpsc::channel();
+    let port = port.to_string();
     thread::spawn(move || {
         let mut reader = BufReader::new(stdout);
         let mut line = Vec::new();
         let mut byte = [0u8; 1];
         let mut found = false;
+        // Once an unterminated record exceeds MAX_LINE_BYTES, every further
+        // byte up to its next newline is discarded rather than accumulated
+        // into a fresh `line`: without this, a byte cleared from an
+        // oversized record could immediately start `line` over, and that
+        // record's own tail could then be misparsed as a standalone
+        // readiness line at the eventual newline.
+        let mut skipping_oversized = false;
         loop {
             match std::io::Read::read(&mut reader, &mut byte) {
                 Ok(0) | Err(_) => break,
                 Ok(_) if byte[0] == b'\n' => {
-                    if !found {
+                    if !found && !skipping_oversized {
                         if let Ok(text) = std::str::from_utf8(&line) {
-                            if let Some(url) = parse_ready_url(text.trim_end_matches('\r')) {
+                            if let Some(url) = parse_ready_url(text.trim_end_matches('\r'), &port) {
                                 found = tx.send(url).is_ok();
                             }
                         }
                     }
                     line.clear();
+                    skipping_oversized = false;
                 }
+                Ok(_) if skipping_oversized => {}
                 Ok(_) => {
                     line.push(byte[0]);
                     if line.len() > MAX_LINE_BYTES {
                         line.clear();
+                        skipping_oversized = true;
                     }
                 }
             }
@@ -276,7 +322,12 @@ fn wait_for_exit(child: &mut Child, timeout: Duration) -> Option<ExitStatus> {
 ///
 /// On Unix, tries a graceful `SIGTERM` first, giving it 5s to exit — so the
 /// CLI can run its normal shutdown path (flushing Session/storage state) —
-/// before escalating to `SIGKILL`.
+/// before escalating to `SIGKILL`. Both signals target `child`'s whole
+/// process group (see [`own_process_group`]), not just its own PID: a Web
+/// session can own detached tool/plugin subprocesses that only `dsh`'s own
+/// graceful disposal stops, so if that grace period is exceeded, signaling
+/// only `dsh` itself would leave them running with nothing left to dispose
+/// of them.
 ///
 /// On Windows there is no such graceful step: this repository's own
 /// documented Windows process semantics
@@ -317,8 +368,12 @@ fn terminate(mut child: Child) {
             .arg("/F")
             .status();
     } else {
-        let _ = Command::new("kill").arg("-TERM").arg(child.id().to_string()).status();
+        let group = format!("-{}", child.id());
+        let _ = Command::new("kill").arg("-TERM").arg(&group).status();
         if wait_for_exit(&mut child, Duration::from_secs(5)).is_none() {
+            let _ = Command::new("kill").arg("-KILL").arg(&group).status();
+            // Belt and braces: ensure the direct child itself is reaped even
+            // if the group-targeted kill above failed for some reason.
             let _ = child.kill();
         }
     }
@@ -563,7 +618,7 @@ fn main() {
                             // navigate to.
                             return;
                         }
-                        match wait_for_ready_url(&profile, stdout, Duration::from_secs(30)) {
+                        match wait_for_ready_url(&profile, stdout, &port, Duration::from_secs(30)) {
                             Some(url) => url,
                             None => {
                                 // Startup failed outright, or timed out with
@@ -583,7 +638,12 @@ fn main() {
                     }
                 };
                 if let Some(window) = handle.get_webview_window("main") {
-                    let _ = window.navigate(url.parse().expect("well-formed URL"));
+                    let target = url.parse().unwrap_or_else(|error| {
+                        message_page(&format!("dsh web announced an unparseable URL ({error}): {url}"))
+                            .parse()
+                            .expect("message_page always produces a well-formed data: URL")
+                    });
+                    let _ = window.navigate(target);
                 }
             });
 
