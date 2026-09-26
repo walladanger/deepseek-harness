@@ -59,6 +59,14 @@ UNC path, say) could in principle block the app from closing for as long as
 the underlying `Command::spawn()` call takes to fail, rather than for any
 fixed bound.
 
+On Unix, a `SIGINT` (Ctrl-C in a foreground `cargo run` session) or
+`SIGTERM` delivered to this process directly runs the same stop rather than
+letting the OS's default disposition end the process with no chance to
+clean up: neither signal reaches Tauri's own window-close handling, and
+[moving `dsh` out of this process's own process group](#launch-policy) means
+`dsh` would not receive a terminal's Ctrl-C either, so without this handler
+it would keep running, bound to its port, after the shell itself was gone.
+
 ## Known limitations
 
 This is an early evaluation shell, and two gaps are accepted for now rather

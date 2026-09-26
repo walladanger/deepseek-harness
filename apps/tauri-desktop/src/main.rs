@@ -378,13 +378,23 @@ fn wait_for_exit(child: &mut Child, timeout: Duration) -> Option<ExitStatus> {
 /// only that direct child would leak the Node process and its bound port.
 /// `taskkill /T` targets the whole process tree instead.
 fn terminate(mut child: Child) {
-    match child.try_wait() {
-        Ok(Some(_)) => return,
-        Ok(None) => {}
+    // A leader that already exited (observed here or earlier by
+    // `wait_for_ready_url`'s polling) still needs its group checked on Unix:
+    // a same-group descendant (a tool/plugin subprocess dsh spawned and left
+    // detached) can outlive dsh itself, and only a numeric PID reuse risk —
+    // not "the leader is gone" — makes signaling unsafe. On Windows the
+    // child is `cmd.exe` directly wrapping the process tree `taskkill /T`
+    // targets, so an already-exited leader has no separate tree to clean up
+    // and can return early.
+    let leader_exited = match child.try_wait() {
+        Ok(Some(_)) => true,
+        Ok(None) => false,
         Err(_) => return,
-    }
-
+    };
     if cfg!(target_os = "windows") {
+        if leader_exited {
+            return;
+        }
         let _ = no_console_window(Command::new("taskkill"))
             .arg("/PID")
             .arg(child.id().to_string())
@@ -393,15 +403,19 @@ fn terminate(mut child: Child) {
             .status();
     } else {
         let group = format!("-{}", child.id());
-        let _ = Command::new("kill").arg("-TERM").arg(&group).status();
-        wait_for_exit(&mut child, Duration::from_secs(5));
+        if !leader_exited {
+            let _ = Command::new("kill").arg("-TERM").arg(&group).status();
+            wait_for_exit(&mut child, Duration::from_secs(5));
+        }
         // Escalate based on whether the *group* is empty, not just whether
         // dsh (the leader) itself has exited: a descendant that ignores
         // SIGTERM can outlive a dsh that exits quickly within the grace
         // period, and checking only the leader would then skip the SIGKILL
         // that descendant needs. `kill -0` against the group is the
         // portable way to ask "does anything in this group still exist?"
-        // without a process-listing API.
+        // without a process-listing API. This runs even when the leader had
+        // already exited before this call started: a surviving descendant
+        // is exactly the case a leader-only check would miss.
         let group_alive = Command::new("kill").arg("-0").arg(&group).status().is_ok_and(|status| status.success());
         if group_alive {
             let _ = Command::new("kill").arg("-KILL").arg(&group).status();
@@ -614,6 +628,40 @@ fn startup_failure_page(captured_stderr: &Mutex<Vec<u8>>, stderr_done: &mpsc::Re
 /// window-build failure can never happen after a child was already spawned,
 /// so `setup`'s only fallible step that runs before the child exists cannot
 /// leak it.
+/// Runs `shutdown` and exits the process when the OS delivers `SIGINT` or
+/// `SIGTERM` directly to this process.
+///
+/// Neither signal reaches Tauri's own `RunEvent::ExitRequested`: that event
+/// fires only for requests routed through the windowing system (a window
+/// close, or an explicit `AppHandle::exit`), not for a signal handled by the
+/// OS's own default disposition, which is to terminate the process
+/// immediately without running any of this process's own code. A `dsh`
+/// running under a `cargo run` foreground session (Ctrl-C) or killed
+/// directly (`SIGTERM`) would otherwise never run [`shutdown`]: because
+/// [`own_process_group`] deliberately moves `dsh` out of this process's own
+/// group so a whole-group signal in [`terminate`] cannot also hit this
+/// shell, `dsh` does not receive the terminal's Ctrl-C/SIGINT either, and
+/// would keep running, bound to its port, after this process is gone.
+#[cfg(unix)]
+fn install_unix_signal_shutdown(handle: AppHandle) {
+    use signal_hook::consts::{SIGINT, SIGTERM};
+    use signal_hook::iterator::Signals;
+
+    let mut signals = match Signals::new([SIGINT, SIGTERM]) {
+        Ok(signals) => signals,
+        Err(_) => return,
+    };
+    thread::spawn(move || {
+        if signals.forever().next().is_some() {
+            shutdown(&handle.state::<WebProfile>());
+            std::process::exit(0);
+        }
+    });
+}
+
+#[cfg(not(unix))]
+fn install_unix_signal_shutdown(_handle: AppHandle) {}
+
 fn main() {
     let port = env::var("DSH_WEB_PORT").unwrap_or_else(|_| "5175".to_string());
 
@@ -634,6 +682,8 @@ fn main() {
                 .inner_size(1280.0, 860.0)
                 .min_inner_size(800.0, 600.0)
                 .build()?;
+
+            install_unix_signal_shutdown(app.handle().clone());
 
             let handle: AppHandle = app.handle().clone();
             thread::spawn(move || {
