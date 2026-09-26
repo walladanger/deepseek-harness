@@ -6,17 +6,32 @@
 
 use std::env;
 use std::io::{BufRead, BufReader};
-use std::process::{Child, ChildStdout, Command, ExitStatus, Stdio};
-use std::sync::{mpsc, Mutex};
+use std::process::{Child, ChildStderr, ChildStdout, Command, ExitStatus, Stdio};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use tauri::{AppHandle, Manager, State, WebviewUrl, WebviewWindowBuilder};
 
-/// The wrapped `dsh web` child process. Held for the app's lifetime so
-/// window-close can terminate it.
+/// The wrapped `dsh web` child process, tracked through its lifecycle so a
+/// shutdown request racing with the still-in-flight spawn cannot leak it
+/// (see [`shutdown`]).
+enum ChildSlot {
+    /// `spawn_web_profile` has not returned yet.
+    Pending,
+    /// `dsh web` is running as this child.
+    Running(Child),
+    /// `shutdown` has already run. A child that finishes spawning after this
+    /// (see the `Err` arm in `main`'s spawn thread) must be killed
+    /// immediately rather than stored here, since nothing will ever look at
+    /// this slot again to stop it.
+    Stopped,
+}
+
+/// Holds the wrapped `dsh web` child's lifecycle state for the app's
+/// lifetime, so window-close can terminate it.
 struct WebProfile {
-    child: Mutex<Option<Child>>,
+    child: Mutex<ChildSlot>,
 }
 
 /// Adds the Windows `CREATE_NO_WINDOW` flag so a console-subsystem process
@@ -57,19 +72,21 @@ fn dsh_command() -> Command {
     no_console_window(command)
 }
 
-/// Spawns `dsh --profile web` bound to `host:port`. Stdout is piped (not
-/// discarded): `dsh web` announces its authenticated launch URL there, and
-/// index requests without that URL's token or an existing session cookie
-/// are rejected with 401, so a bare `http://host:port` cannot be
-/// constructed by this shell and must be read from that announcement
-/// instead. Stdin and stderr are discarded, since this shell has no console
-/// to show the latter in.
+/// Spawns `dsh --profile web` bound to `host:port`. Stdout and stderr are
+/// both piped rather than discarded: `dsh web` announces its authenticated
+/// launch URL on stdout (index requests without that URL's token or an
+/// existing session cookie are rejected with 401, so a bare
+/// `http://host:port` cannot be constructed by this shell and must be read
+/// from that announcement instead), and, if the web profile fails to start,
+/// writes the actionable cause to stderr — this shell's packaged Windows
+/// release has no console to show either stream in otherwise, so both are
+/// read back and surfaced in the window instead. Stdin is discarded.
 fn spawn_web_profile(host: &str, port: &str) -> std::io::Result<Child> {
     dsh_command()
         .args(["--profile", "web", "--host", host, "--port", port, "--no-open"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
 }
 
@@ -79,6 +96,26 @@ fn spawn_web_profile(host: &str, port: &str) -> std::io::Result<Child> {
 fn parse_ready_url(line: &str) -> Option<String> {
     let url = line.strip_prefix("dsh web: ")?.split_whitespace().next()?;
     (url.starts_with("http://") || url.starts_with("https://")).then(|| url.to_string())
+}
+
+/// Reads `stderr` on a dedicated thread, returning a handle to its
+/// accumulated lines (bounded to the most recent `MAX_LINES`, so a runaway
+/// or looping process cannot grow this without bound) for the caller to
+/// read back if `dsh web` fails to announce readiness.
+fn spawn_stderr_capture(stderr: ChildStderr) -> Arc<Mutex<Vec<String>>> {
+    const MAX_LINES: usize = 200;
+    let lines = Arc::new(Mutex::new(Vec::new()));
+    let writer = Arc::clone(&lines);
+    thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            let mut lines = writer.lock().expect("stderr capture mutex poisoned");
+            if lines.len() >= MAX_LINES {
+                lines.remove(0);
+            }
+            lines.push(line);
+        }
+    });
+    lines
 }
 
 /// Blocks the calling thread until `dsh web` announces its authenticated
@@ -112,9 +149,11 @@ fn wait_for_ready_url(profile: &WebProfile, stdout: ChildStdout, timeout: Durati
             Ok(url) => return Some(url),
             Err(mpsc::RecvTimeoutError::Disconnected) => return None,
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                let mut child = profile.child.lock().expect("web profile mutex poisoned");
-                if matches!(child.as_mut().map(|c| c.try_wait()), Some(Ok(Some(_))) | Some(Err(_))) {
-                    return None;
+                let mut guard = profile.child.lock().expect("web profile mutex poisoned");
+                if let ChildSlot::Running(child) = &mut *guard {
+                    if matches!(child.try_wait(), Ok(Some(_)) | Err(_)) {
+                        return None;
+                    }
                 }
             }
         }
@@ -135,9 +174,20 @@ fn wait_for_exit(child: &mut Child, timeout: Duration) -> Option<ExitStatus> {
     None
 }
 
-/// Kills and waits on the wrapped `dsh web` child process, if it is still
-/// running. Called on window close and on app exit so no orphaned `dsh`
-/// process survives the shell.
+/// Kills and waits on the wrapped `dsh web` child process, if it is running
+/// or still spawning. Called on window close and on app exit so no orphaned
+/// `dsh` process survives the shell.
+///
+/// Marks the shared slot `Stopped` before anything else, atomically with
+/// respect to the spawn thread's own check in `main`: if `dsh` is still in
+/// the process of spawning (the slot is `Pending`) when this runs, this
+/// leaves nothing to kill directly, but the spawn thread will see `Stopped`
+/// once it finishes and kill that child itself instead of handing it to the
+/// window. Without that shared check, a window closed in the brief window
+/// between the spawn starting and its `Child` being recorded here would
+/// leave `dsh web` running unmanaged after the app had already begun
+/// exiting: `shutdown` would find `Pending`/nothing to stop, and the spawn
+/// thread would have no way to know a shutdown had already started.
 ///
 /// Tries a graceful stop first (`SIGTERM` on Unix, `taskkill` without `/F`
 /// on Windows) and gives it 5s to exit before force-killing, so the CLI can
@@ -149,8 +199,13 @@ fn wait_for_exit(child: &mut Child, timeout: Duration) -> Option<ExitStatus> {
 /// killing only that direct child would leak the Node process and its
 /// bound port. `taskkill /T` targets the whole process tree instead.
 fn shutdown(profile: &State<WebProfile>) {
-    let Some(mut child) = profile.child.lock().expect("web profile mutex poisoned").take() else {
-        return;
+    let previous = {
+        let mut guard = profile.child.lock().expect("web profile mutex poisoned");
+        std::mem::replace(&mut *guard, ChildSlot::Stopped)
+    };
+    let mut child = match previous {
+        ChildSlot::Running(child) => child,
+        ChildSlot::Pending | ChildSlot::Stopped => return,
     };
 
     // wait_for_ready_url's own polling may already have observed this child
@@ -222,9 +277,22 @@ fn encode_for_data_url(input: &str) -> String {
 fn message_page(message: &str) -> String {
     format!(
         "data:text/html,<!doctype html><html><body style='background:%23111;color:%23eee;\
-         font-family:sans-serif;padding:2rem'><p>{}</p></body></html>",
+         font-family:sans-serif;padding:2rem;white-space:pre-wrap'><p>{}</p></body></html>",
         encode_for_data_url(message)
     )
+}
+
+/// Builds the page shown when `dsh web` never announced readiness: the
+/// captured stderr tail if `dsh` wrote one (the CLI's own actionable cause
+/// for the web profile failing to start), otherwise the generic timeout
+/// message.
+fn startup_failure_page(captured_stderr: &Mutex<Vec<String>>) -> String {
+    let diagnostic = captured_stderr.lock().expect("stderr capture mutex poisoned").join("\n");
+    if diagnostic.trim().is_empty() {
+        message_page(TIMEOUT_MESSAGE)
+    } else {
+        message_page(&format!("dsh web failed to start:\n\n{diagnostic}"))
+    }
 }
 
 /// Spawns the `dsh web` profile, opens a single window showing a loading
@@ -247,7 +315,7 @@ fn main() {
     let port = env::var("DSH_WEB_PORT").unwrap_or_else(|_| "5175".to_string());
 
     tauri::Builder::default()
-        .manage(WebProfile { child: Mutex::new(None) })
+        .manage(WebProfile { child: Mutex::new(ChildSlot::Pending) })
         .setup(move |app: &mut tauri::App| {
             WebviewWindowBuilder::new(app, "main", WebviewUrl::External(LOADING_HTML.parse()?))
                 .title("DeepSeek Harness")
@@ -261,9 +329,37 @@ fn main() {
                 let url = match spawn_web_profile(&host, &port) {
                     Ok(mut child) => {
                         let stdout = child.stdout.take().expect("spawn_web_profile pipes stdout");
-                        *profile.child.lock().expect("web profile mutex poisoned") = Some(child);
-                        wait_for_ready_url(&profile, stdout, Duration::from_secs(30))
-                            .unwrap_or_else(|| message_page(TIMEOUT_MESSAGE))
+                        let stderr = child.stderr.take().expect("spawn_web_profile pipes stderr");
+                        let captured_stderr = spawn_stderr_capture(stderr);
+
+                        let mut guard = profile.child.lock().expect("web profile mutex poisoned");
+                        let recorded = match std::mem::replace(&mut *guard, ChildSlot::Pending) {
+                            ChildSlot::Pending => {
+                                *guard = ChildSlot::Running(child);
+                                Ok(())
+                            }
+                            ChildSlot::Stopped => {
+                                *guard = ChildSlot::Stopped;
+                                Err(child)
+                            }
+                            ChildSlot::Running(_) => unreachable!("spawn_web_profile runs exactly once"),
+                        };
+                        drop(guard);
+
+                        match recorded {
+                            Ok(()) => wait_for_ready_url(&profile, stdout, Duration::from_secs(30))
+                                .unwrap_or_else(|| startup_failure_page(&captured_stderr)),
+                            Err(mut child) => {
+                                // shutdown() already ran while dsh was still spawning: it
+                                // found nothing to stop and returned. Stop this one now
+                                // instead of leaving it to run unmanaged after the app has
+                                // already begun exiting; there is no window left to show
+                                // anything in, so just return.
+                                let _ = child.kill();
+                                let _ = child.wait();
+                                return;
+                            }
+                        }
                     }
                     Err(error) => message_page(&format!(
                         "failed to launch `dsh --profile web` (checked DSH_CLI_PATH, then PATH): {error}"
