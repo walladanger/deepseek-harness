@@ -41,6 +41,12 @@ jobs:
           git config user.name "gemini-cli[bot]"
           git config user.email "gemini-cli[bot]@users.noreply.github.com"
 
+      # The checked-out ref may be an external fork's head, whose .gemini/
+      # and .env content Gemini CLI would otherwise load and execute with
+      # this job's contents:write permissions and GEMINI_CLI_KEY in scope.
+      - name: Remove untrusted workspace configuration
+        run: rm -rf .gemini .env
+
       - name: Run Gemini CLI
         uses: google-github-actions/run-gemini-cli@v0
         env:

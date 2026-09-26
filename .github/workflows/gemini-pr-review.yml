@@ -12,11 +12,19 @@ concurrency:
 
 jobs:
   review:
+    # Fork pull_request runs never receive repository secrets, so an
+    # automatic review only makes sense against this repository's own
+    # branches; a fork PR still gets a review through the gated
+    # @gemini-cli /review comment path below.
     if: >-
-      github.event_name == 'pull_request' ||
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.head.repo.full_name == github.repository) ||
       (github.event.issue.pull_request != null &&
        contains(github.event.comment.body, '@gemini-cli') &&
-       contains(github.event.comment.body, '/review'))
+       contains(github.event.comment.body, '/review') &&
+       (github.event.comment.author_association == 'OWNER' ||
+        github.event.comment.author_association == 'COLLABORATOR' ||
+        github.event.comment.author_association == 'MEMBER'))
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -25,6 +33,20 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # A PR comment's default checkout is the base branch; check out
+          # the PR's own head so the diff being reviewed actually exists.
+          ref: >-
+            ${{ github.event.issue.pull_request &&
+                format('refs/pull/{0}/head', github.event.issue.number) ||
+                github.ref }}
+          fetch-depth: 0
+
+      # The checked-out ref may be an external fork's head, whose .gemini/
+      # and .env content Gemini CLI would otherwise load and execute with
+      # this job's GEMINI_CLI_KEY in scope.
+      - name: Remove untrusted workspace configuration
+        run: rm -rf .gemini .env
 
       - name: Run Gemini CLI review
         uses: google-github-actions/run-gemini-cli@v0
