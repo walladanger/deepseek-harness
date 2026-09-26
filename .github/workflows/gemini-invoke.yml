@@ -1,0 +1,61 @@
+name: Gemini CLI Assistant
+
+on:
+  issue_comment:
+    types: [created]
+
+concurrency:
+  group: gemini-invoke-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  assist:
+    # Restricted to repo owners/collaborators: this job runs with contents:
+    # write and lets the comment body steer an agent that can commit and
+    # push, so an unrestricted trigger would let any commenter drive code
+    # changes with repo write access.
+    if: >-
+      contains(github.event.comment.body, '@gemini-cli') &&
+      !contains(github.event.comment.body, '/review') &&
+      (github.event.comment.author_association == 'OWNER' ||
+       github.event.comment.author_association == 'COLLABORATOR' ||
+       github.event.comment.author_association == 'MEMBER')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # A PR comment's default checkout is the base branch; check out the
+          # PR's own head so a requested fix has something to commit onto.
+          ref: >-
+            ${{ github.event.issue.pull_request &&
+                format('refs/pull/{0}/head', github.event.issue.number) ||
+                github.ref }}
+
+      - name: Configure git identity for commits
+        run: |
+          git config user.name "gemini-cli[bot]"
+          git config user.email "gemini-cli[bot]@users.noreply.github.com"
+
+      - name: Run Gemini CLI
+        uses: google-github-actions/run-gemini-cli@v0
+        with:
+          gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
+          github_pr_number: ${{ github.event.issue.pull_request && github.event.issue.number || '' }}
+          github_issue_number: ${{ github.event.issue.pull_request && '' || github.event.issue.number }}
+          prompt: |
+            You were mentioned as @gemini-cli in a comment on
+            ${{ github.event.issue.pull_request && 'pull request' || 'issue' }}
+            #${{ github.event.issue.number }} in this repository. The comment is:
+
+            ${{ github.event.comment.body }}
+
+            Follow this repository's AGENTS.md conventions. If the request asks you to fix,
+            implement, or change code and this is a pull request, make the smallest correct
+            change, commit it with a clear message, and push it to the current branch. If the
+            request is a question or asks for an explanation, reply as a comment instead of
+            pushing anything.
