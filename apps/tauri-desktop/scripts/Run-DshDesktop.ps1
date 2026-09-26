@@ -112,13 +112,31 @@ if (Get-Process -Name $processName -ErrorAction SilentlyContinue) {
     exit 0
 }
 
+# Saved so a stale value from an earlier invocation in this same PowerShell
+# session (or one already present when it started) is neither silently
+# reused when the corresponding parameter is omitted here, nor left behind
+# for whatever the caller runs next in this session.
+$previousCliPath = $env:DSH_CLI_PATH
+$previousWorkspace = $env:DSH_WEB_WORKSPACE
+$previousPort = $env:DSH_WEB_PORT
+
 $env:DSH_WEB_PORT = $Port
 if ($DshCliPath) {
     $env:DSH_CLI_PATH = $DshCliPath
+} else {
+    Remove-Item Env:\DSH_CLI_PATH -ErrorAction SilentlyContinue
 }
 if ($Workspace) {
     $env:DSH_WEB_WORKSPACE = $Workspace
+} else {
+    Remove-Item Env:\DSH_WEB_WORKSPACE -ErrorAction SilentlyContinue
 }
 
-Start-Process -FilePath $ExePath
-Write-Host "Started $processName (web profile bound to 127.0.0.1:${Port}; the shell navigates its own window to dsh web's announced, authenticated URL)."
+try {
+    Start-Process -FilePath $ExePath
+    Write-Host "Started $processName (web profile bound to 127.0.0.1:${Port}; the shell navigates its own window to dsh web's announced, authenticated URL)."
+} finally {
+    if ($null -eq $previousCliPath) { Remove-Item Env:\DSH_CLI_PATH -ErrorAction SilentlyContinue } else { $env:DSH_CLI_PATH = $previousCliPath }
+    if ($null -eq $previousWorkspace) { Remove-Item Env:\DSH_WEB_WORKSPACE -ErrorAction SilentlyContinue } else { $env:DSH_WEB_WORKSPACE = $previousWorkspace }
+    if ($null -eq $previousPort) { Remove-Item Env:\DSH_WEB_PORT -ErrorAction SilentlyContinue } else { $env:DSH_WEB_PORT = $previousPort }
+}

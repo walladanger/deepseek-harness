@@ -106,7 +106,19 @@ fn own_process_group(command: Command) -> Command {
 fn dsh_command() -> (Command, String) {
     let (command, attempted) = if let Ok(path) = env::var("DSH_CLI_PATH") {
         let attempted = format!("DSH_CLI_PATH={path}");
-        (Command::new(path), attempted)
+        // A relative path (a development-friendly `./node_modules/.bin/dsh`,
+        // say) is resolved by the OS against the *child's* working directory
+        // at exec time on Unix, which spawn_web_profile sets to
+        // `workspace_dir()`, not this shell's own launch directory — so it
+        // must be made absolute here, before that directory change, against
+        // this process's own current directory instead.
+        let resolved = std::path::Path::new(&path);
+        let program = if resolved.is_absolute() {
+            path
+        } else {
+            env::current_dir().map(|cwd| cwd.join(resolved).to_string_lossy().into_owned()).unwrap_or(path)
+        };
+        (Command::new(program), attempted)
     } else if cfg!(target_os = "windows") {
         let mut command = Command::new("cmd");
         command.args(["/C", "dsh"]);
@@ -164,22 +176,32 @@ fn spawn_web_profile(port: &str) -> (std::io::Result<Child>, String) {
 
 /// Extracts the authenticated URL from a `dsh web` readiness line
 /// (`"dsh web: <url>"`, optionally followed by `" (LAN: <url>)"`), verifying
-/// it actually names this shell's own [`WEB_HOST`]:`expected_port` rather
-/// than merely looking like an HTTP(S) URL. `None` if `line` is not that
-/// announcement, or the candidate URL doesn't match.
+/// it actually names this shell's own [`WEB_HOST`] and `expected_port`
+/// rather than merely looking like an HTTP(S) URL. `None` if `line` is not
+/// that announcement, or the candidate URL doesn't match.
 ///
-/// Validating the authority (not just parsing generically) serves two
-/// purposes at once: it rejects a same-looking line some other process
+/// `expected_port == "0"` (the Web CLI's own "let the OS allocate a free
+/// port" value) matches any numeric port instead of the literal `0`: the
+/// announced URL always carries the port actually bound, which this shell
+/// cannot know in advance in that case. Every other `expected_port` must
+/// match exactly.
+///
+/// Validating the authority this way (not just parsing generically) serves
+/// two purposes at once: it rejects a same-looking line some other process
 /// output could coincidentally produce, since only `dsh web` itself would
-/// ever announce exactly this shell's own host and port; and, because the
-/// match requires an exact `http://<host>:<port>` prefix, a malformed
-/// candidate (a stray `[` breaking the authority, say) can never pass,
-/// which is what protected `window.navigate`'s own parse from having to
-/// handle one at all.
+/// ever announce exactly this shell's own host and (fixed) port; and,
+/// because the match requires an exact `http://<host>:<port>` prefix, a
+/// malformed candidate (a stray `[` breaking the authority, say) can never
+/// pass, which is what protects `window.navigate`'s own parse from having
+/// to handle one at all.
 fn parse_ready_url(line: &str, expected_port: &str) -> Option<String> {
     let candidate = line.strip_prefix("dsh web: ")?.split_whitespace().next()?;
-    let expected_origin = format!("http://{WEB_HOST}:{expected_port}");
-    let rest = candidate.strip_prefix(&expected_origin)?;
+    let after_host = candidate.strip_prefix(&format!("http://{WEB_HOST}:"))?;
+    let announced_port_len = after_host.find(|c: char| !c.is_ascii_digit()).unwrap_or(after_host.len());
+    let (announced_port, rest) = after_host.split_at(announced_port_len);
+    if announced_port.is_empty() || (expected_port != "0" && announced_port != expected_port) {
+        return None;
+    }
     (rest.is_empty() || rest.starts_with('/') || rest.starts_with('?')).then(|| candidate.to_string())
 }
 
@@ -325,9 +347,11 @@ fn wait_for_exit(child: &mut Child, timeout: Duration) -> Option<ExitStatus> {
 /// before escalating to `SIGKILL`. Both signals target `child`'s whole
 /// process group (see [`own_process_group`]), not just its own PID: a Web
 /// session can own detached tool/plugin subprocesses that only `dsh`'s own
-/// graceful disposal stops, so if that grace period is exceeded, signaling
-/// only `dsh` itself would leave them running with nothing left to dispose
-/// of them.
+/// graceful disposal stops. Escalation is decided by whether the *group*
+/// still has any member after the grace period, not just whether `dsh`
+/// (the leader) itself exited — a descendant that ignores `SIGTERM` can
+/// outlive a `dsh` that exits quickly, and checking only the leader would
+/// then wrongly skip the `SIGKILL` that descendant needs.
 ///
 /// On Windows there is no such graceful step: this repository's own
 /// documented Windows process semantics
@@ -370,12 +394,23 @@ fn terminate(mut child: Child) {
     } else {
         let group = format!("-{}", child.id());
         let _ = Command::new("kill").arg("-TERM").arg(&group).status();
-        if wait_for_exit(&mut child, Duration::from_secs(5)).is_none() {
+        wait_for_exit(&mut child, Duration::from_secs(5));
+        // Escalate based on whether the *group* is empty, not just whether
+        // dsh (the leader) itself has exited: a descendant that ignores
+        // SIGTERM can outlive a dsh that exits quickly within the grace
+        // period, and checking only the leader would then skip the SIGKILL
+        // that descendant needs. `kill -0` against the group is the
+        // portable way to ask "does anything in this group still exist?"
+        // without a process-listing API.
+        let group_alive = Command::new("kill").arg("-0").arg(&group).status().is_ok_and(|status| status.success());
+        if group_alive {
             let _ = Command::new("kill").arg("-KILL").arg(&group).status();
-            // Belt and braces: ensure the direct child itself is reaped even
-            // if the group-targeted kill above failed for some reason.
-            let _ = child.kill();
         }
+        // Belt and braces: ensure the direct child itself is reaped even if
+        // the group-targeted kill above failed for some reason, or was
+        // skipped because only descendants (not dsh itself) were still
+        // alive.
+        let _ = child.kill();
     }
     let _ = child.wait();
 }
