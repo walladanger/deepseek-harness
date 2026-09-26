@@ -43,6 +43,10 @@ jobs:
 
       - name: Run Gemini CLI
         uses: google-github-actions/run-gemini-cli@v0
+        env:
+          # The checked-out CI workspace is never interactively trusted, so
+          # Gemini CLI's headless trusted-folder check must be bypassed here.
+          GEMINI_CLI_TRUST_WORKSPACE: 'true'
         with:
           gemini_api_key: ${{ secrets.GEMINI_CLI_KEY }}
           github_pr_number: ${{ github.event.issue.pull_request && github.event.issue.number || '' }}
