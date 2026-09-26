@@ -153,6 +153,19 @@ fn shutdown(profile: &State<WebProfile>) {
         return;
     };
 
+    // wait_for_ready_url's own polling may already have observed this child
+    // exit via try_wait() without anyone taking it out of `profile.child`. On
+    // Unix, a try_wait() that returns an exit status has already reaped the
+    // process, so its numeric PID could since have been recycled by the OS;
+    // signaling it now (via `kill`/`taskkill` by PID) could hit an unrelated
+    // process rather than this one. If it has already exited, there is
+    // nothing left to stop.
+    match child.try_wait() {
+        Ok(Some(_)) => return,
+        Ok(None) => {}
+        Err(_) => return,
+    }
+
     if cfg!(target_os = "windows") {
         let _ = no_console_window(Command::new("taskkill")).arg("/PID").arg(child.id().to_string()).arg("/T").status();
     } else {
@@ -180,27 +193,61 @@ font-family:sans-serif;display:flex;align-items:center;\
 justify-content:center;height:100vh;margin:0'>\
 <p>Starting DeepSeek Harness&hellip;</p></body></html>";
 
-const TIMEOUT_HTML: &str = "data:text/html,\
-<!doctype html><html><body style='background:%23111;color:%23eee;\
-font-family:sans-serif;padding:2rem'>\
-<p>dsh web did not become reachable within 30s. Check that `dsh` \
-is on PATH and the configured port is free, then restart.</p></body></html>";
+const TIMEOUT_MESSAGE: &str =
+    "dsh web did not become reachable within 30s. Check that `dsh` is on PATH and the configured port is free, then restart.";
+
+/// Percent-encodes the characters that a `data:` URL's opaque path cannot
+/// carry literally: `#` and `?` both terminate that path early (starting a
+/// fragment or query, per the generic URL syntax, even for a
+/// cannot-be-a-base scheme like `data:`), `%` would otherwise be
+/// misinterpreted as the start of an existing percent-encoding, and raw
+/// control characters (e.g. a newline from a wrapped error message) are
+/// invalid there outright. Everything else is passed through unchanged.
+fn encode_for_data_url(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match ch {
+            '%' => out.push_str("%25"),
+            '#' => out.push_str("%23"),
+            '?' => out.push_str("%3F"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("%{:02X}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Builds a `data:` URL for a short plain-text diagnostic message, styled
+/// the same as [`LOADING_HTML`].
+fn message_page(message: &str) -> String {
+    format!(
+        "data:text/html,<!doctype html><html><body style='background:%23111;color:%23eee;\
+         font-family:sans-serif;padding:2rem'><p>{}</p></body></html>",
+        encode_for_data_url(message)
+    )
+}
 
 /// Spawns the `dsh web` profile, opens a single window showing a loading
 /// placeholder, then navigates that window to the profile's announced,
-/// authenticated URL once it is ready (or to a timeout page after 30s).
-/// Tears the child process down on window close or app exit.
+/// authenticated URL once it is ready (or to a diagnostic page on launch
+/// failure or a 30s timeout). Tears the child process down on window close
+/// or app exit.
+///
+/// The window is built before `dsh` is ever spawned, and spawning happens
+/// only in the background thread after that succeeds: a `dsh` launch
+/// failure (missing PATH entry, bad `DSH_CLI_PATH`) is shown as a message in
+/// the already-open window rather than panicking before any window exists —
+/// which, in the packaged Windows release (`windows_subsystem = "windows"`),
+/// would otherwise fail with no visible error at all. It also means a
+/// window-build failure can never happen after a child was already spawned,
+/// so `setup`'s only fallible step that runs before the child exists cannot
+/// leak it.
 fn main() {
     let host = env::var("DSH_WEB_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
     let port = env::var("DSH_WEB_PORT").unwrap_or_else(|_| "5175".to_string());
 
-    let mut child = spawn_web_profile(&host, &port).unwrap_or_else(|error| {
-        panic!("failed to launch `dsh --profile web` (checked DSH_CLI_PATH, then PATH): {error}");
-    });
-    let stdout = child.stdout.take().expect("spawn_web_profile pipes stdout");
-
     tauri::Builder::default()
-        .manage(WebProfile { child: Mutex::new(Some(child)) })
+        .manage(WebProfile { child: Mutex::new(None) })
         .setup(move |app: &mut tauri::App| {
             WebviewWindowBuilder::new(app, "main", WebviewUrl::External(LOADING_HTML.parse()?))
                 .title("DeepSeek Harness")
@@ -211,8 +258,17 @@ fn main() {
             let handle: AppHandle = app.handle().clone();
             thread::spawn(move || {
                 let profile = handle.state::<WebProfile>();
-                let url = wait_for_ready_url(&profile, stdout, Duration::from_secs(30))
-                    .unwrap_or_else(|| TIMEOUT_HTML.to_string());
+                let url = match spawn_web_profile(&host, &port) {
+                    Ok(mut child) => {
+                        let stdout = child.stdout.take().expect("spawn_web_profile pipes stdout");
+                        *profile.child.lock().expect("web profile mutex poisoned") = Some(child);
+                        wait_for_ready_url(&profile, stdout, Duration::from_secs(30))
+                            .unwrap_or_else(|| message_page(TIMEOUT_MESSAGE))
+                    }
+                    Err(error) => message_page(&format!(
+                        "failed to launch `dsh --profile web` (checked DSH_CLI_PATH, then PATH): {error}"
+                    )),
+                };
                 if let Some(window) = handle.get_webview_window("main") {
                     let _ = window.navigate(url.parse().expect("well-formed URL"));
                 }
