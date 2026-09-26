@@ -44,7 +44,7 @@ jobs:
       - name: Run Gemini CLI
         uses: google-github-actions/run-gemini-cli@v0
         with:
-          gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
+          gemini_api_key: ${{ secrets.GEMINI_CLI_KEY }}
           github_pr_number: ${{ github.event.issue.pull_request && github.event.issue.number || '' }}
           github_issue_number: ${{ github.event.issue.pull_request && '' || github.event.issue.number }}
           prompt: |
