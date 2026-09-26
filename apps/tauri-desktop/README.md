@@ -102,6 +102,22 @@ rather than fixed:
   spawn inside it is still in flight, not something the fallback's own
   logic can close; it needs the same unresponsive `DSH_CLI_PATH` condition
   as that unbounded wait, on top of adverse timing, to occur at all.
+- Forced Unix termination only reaches `dsh`'s own process group. A tool or
+  plugin subprocess `dsh` itself launched in a *separate* group (the
+  fallback path in `packages/subprocess/subprocess-local/src/spawn.ts`) or
+  through a detached `systemd-run` scope
+  (`packages/subprocess/subprocess-local/src/linux-scope.ts`, Linux only)
+  is outside it, and can only be stopped by `dsh`'s own graceful shutdown —
+  which the 5s `SIGTERM` grace period this shell already gives it exists
+  precisely to allow. If that shutdown doesn't finish in time and this
+  shell escalates to `SIGKILL` on `dsh`'s own group, a range like that can
+  outlive it. There is no PID or scope identifier this shell could act on
+  to reach such a range itself: that bookkeeping is internal to the `dsh`
+  process, is not exposed through any external interface, and reimplementing
+  it here would mean duplicating that package's own ownership tracking
+  outside the process that owns it, untested, in an experimental shell —
+  the same reasoning that keeps this shell from reimplementing Windows's
+  own console-signal machinery for a real graceful stop there.
 
 ## Use
 

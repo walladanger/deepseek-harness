@@ -131,16 +131,22 @@ fn resolve_dsh_on_path() -> Option<std::path::PathBuf> {
 /// `PATHEXT` the way `cmd.exe` does), and a `.cmd`/`.bat` result still runs
 /// through `cmd /C`, which can execute a script file directly but not a
 /// bare native binary — a resolved `.exe` (or an extensionless PATH entry)
-/// is instead run directly, with no `cmd.exe` involved at all. If `PATH`
-/// search itself turns up nothing, falls back to the previous unqualified
-/// `cmd /C dsh` (this is no *more* exposed to the lookup-order hazard above
-/// than not finding `dsh` at all already was).
+/// is instead run directly, with no `cmd.exe` involved at all.
+///
+/// `None` if `PATH` search itself turns up nothing (Windows only — `dsh` is
+/// always attempted on other platforms, matching `Command::new("dsh")`'s
+/// own PATH search): falling back to an unqualified `cmd /C dsh` here would
+/// reintroduce exactly the lookup-order hazard [`resolve_dsh_on_path`]
+/// exists to close, since that fallback command still runs after
+/// `spawn_web_profile` sets the child's working directory to
+/// `workspace_dir()`. The caller reports this as an ordinary launch failure
+/// rather than ever spawning it.
 ///
 /// Returns the command alongside a description of what it actually attempted
 /// (naming the literal `DSH_CLI_PATH` value, or "PATH"), so a launch failure
 /// can report the real cause instead of a generic "checked X, then Y" that
 /// may not describe what happened for this particular launch.
-fn dsh_command() -> (Command, String) {
+fn dsh_command() -> Option<(Command, String)> {
     let (command, attempted) = if let Ok(path) = env::var("DSH_CLI_PATH") {
         let attempted = format!("DSH_CLI_PATH={path}");
         // A relative path (a development-friendly `./node_modules/.bin/dsh`,
@@ -157,38 +163,30 @@ fn dsh_command() -> (Command, String) {
         };
         (Command::new(program), attempted)
     } else {
-        dsh_on_path_command()
+        dsh_on_path_command()?
     };
-    (own_process_group(no_console_window(command)), attempted)
+    Some((own_process_group(no_console_window(command)), attempted))
 }
 
 #[cfg(windows)]
-fn dsh_on_path_command() -> (Command, String) {
-    match resolve_dsh_on_path() {
-        Some(resolved) => {
-            let attempted = format!("`dsh` on PATH ({})", resolved.display());
-            let is_script =
-                resolved.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat"));
-            let command = if is_script {
-                let mut command = Command::new("cmd");
-                command.arg("/C").arg(&resolved);
-                command
-            } else {
-                Command::new(&resolved)
-            };
-            (command, attempted)
-        }
-        None => {
-            let mut command = Command::new("cmd");
-            command.args(["/C", "dsh"]);
-            (command, "`dsh` on PATH".to_string())
-        }
-    }
+fn dsh_on_path_command() -> Option<(Command, String)> {
+    let resolved = resolve_dsh_on_path()?;
+    let attempted = format!("`dsh` on PATH ({})", resolved.display());
+    let is_script =
+        resolved.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat"));
+    let command = if is_script {
+        let mut command = Command::new("cmd");
+        command.arg("/C").arg(&resolved);
+        command
+    } else {
+        Command::new(&resolved)
+    };
+    Some((command, attempted))
 }
 
 #[cfg(not(windows))]
-fn dsh_on_path_command() -> (Command, String) {
-    (Command::new("dsh"), "`dsh` on PATH".to_string())
+fn dsh_on_path_command() -> Option<(Command, String)> {
+    Some((Command::new("dsh"), "`dsh` on PATH".to_string()))
 }
 
 /// Resolves the working directory `dsh web` should run in: `DSH_WEB_WORKSPACE`
@@ -222,9 +220,16 @@ fn workspace_dir() -> Option<String> {
 /// in the window instead. Stdin is discarded.
 ///
 /// Returns the description from [`dsh_command`] alongside the spawn result,
-/// so a failure can be reported against what was actually attempted.
+/// so a failure can be reported against what was actually attempted. A
+/// `None` from [`dsh_command`] (PATH search found nothing on Windows) is
+/// reported as an ordinary launch failure without ever building or spawning
+/// a `Command` at all — never falling back to letting the OS search for an
+/// unqualified `dsh` in the child's own working directory.
 fn spawn_web_profile(port: &str) -> (std::io::Result<Child>, String) {
-    let (mut command, attempted) = dsh_command();
+    let Some((mut command, attempted)) = dsh_command() else {
+        let error = std::io::Error::new(std::io::ErrorKind::NotFound, "no `dsh` executable found on PATH");
+        return (Err(error), "`dsh` on PATH".to_string());
+    };
     command
         .args(["--profile", "web", "--host", WEB_HOST, "--port", port, "--no-open"])
         .stdin(Stdio::null())
