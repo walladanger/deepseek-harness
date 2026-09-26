@@ -8,15 +8,28 @@ on:
 
 concurrency:
   group: gemini-pr-review-${{ github.event.pull_request.number || github.event.issue.number }}
-  cancel-in-progress: false
+  # A newer push or comment supersedes an in-flight review of a stale
+  # diff; queuing every push instead would burn API quota on reviews
+  # nobody reads.
+  cancel-in-progress: true
 
 jobs:
   review:
+    # Fork pull_request runs never receive repository secrets, and the
+    # gated @gemini-cli /review comment path below is restricted to this
+    # repository's own branches too (see "Verify the PR head" below) since
+    # checking out a fork's tree would run its own scripts under Gemini
+    # CLI's headless execution; a fork PR's automated review is therefore
+    # unsupported either way and needs a maintainer's manual review.
     if: >-
-      github.event_name == 'pull_request' ||
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.head.repo.full_name == github.repository) ||
       (github.event.issue.pull_request != null &&
        contains(github.event.comment.body, '@gemini-cli') &&
-       contains(github.event.comment.body, '/review'))
+       contains(github.event.comment.body, '/review') &&
+       (github.event.comment.author_association == 'OWNER' ||
+        github.event.comment.author_association == 'COLLABORATOR' ||
+        github.event.comment.author_association == 'MEMBER'))
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -25,9 +38,74 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # A pull_request event's default ref (refs/pull/N/merge) is never
+          # generated for a PR with merge conflicts, which would fail this
+          # checkout before "Check out the PR head" below ever replaces it
+          # with the real head anyway; check out the base branch here
+          # instead, on both trigger paths.
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+
+      # A fork PR's own package.json scripts, Makefile, or repository
+      # tooling would otherwise run under Gemini CLI's headless execution
+      # with this job's secrets and pull-requests:write/issues:write
+      # permissions in scope, so its head repository must be verified
+      # before anything from its tree is checked out — not merely before
+      # Gemini CLI runs. The pull_request trigger's `if:` above already
+      # guarantees this, so only the issue_comment path (whose payload
+      # carries no head-repository field) needs the runtime check.
+      - name: Verify the PR head is this repository's own branch
+        if: ${{ github.event_name == 'issue_comment' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          head_repo_full=$(gh pr view "${{ github.event.issue.number }}" --json headRepository --jq '.headRepository.nameWithOwner')
+          if [ "${head_repo_full}" != "${{ github.repository }}" ]; then
+            echo "::error::PR #${{ github.event.issue.number }} head is an external fork (${head_repo_full}); gemini-pr-review does not support reviewing fork content. Review it manually instead."
+            exit 1
+          fi
+
+      # Only reachable once the PR is known to be this repository's own
+      # branch (pull_request's `if:`, or the verification step above for
+      # issue_comment); checking out refs/pull/N/head here, rather than in
+      # the initial checkout, is what keeps an unverified fork's tree off
+      # disk in the first place. gh pr checkout resolves the same head
+      # commit for both trigger paths, unlike github.ref (refs/pull/N/merge
+      # for pull_request events), which GitHub never generates for a PR
+      # with merge conflicts.
+      - name: Check out the PR head
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh pr checkout ${{ github.event.pull_request.number || github.event.issue.number }}
+
+      # .gemini/ and .env are stripped even though the checkout above is
+      # now verified to be this repository's own branch, guarding against a
+      # compromised or stale branch. .agents/ is deliberately left alone:
+      # a PR may legitimately be adding or editing skills and Agent Notes
+      # under it, and this job never commits, so there is nothing to
+      # protect against here beyond the collaborator gate already above.
+      - name: Remove untrusted workspace configuration
+        run: rm -rf .gemini .env
+
+      # google-github-actions/run-gemini-cli's own env: block does not
+      # reach the token into Gemini CLI's shell tool, which strips
+      # GH_TOKEN/GITHUB_TOKEN from spawned subprocesses; authenticate gh
+      # at the system level instead so `gh pr review`/`gh pr comment`
+      # keep working from inside the agent's shell calls. setup-git wires
+      # the same credential into git itself, for any git operation beyond
+      # the push actions/checkout already configured a token for.
+      - name: Authenticate GitHub CLI
+        run: |
+          echo "${{ github.token }}" | gh auth login --with-token
+          gh auth setup-git
 
       - name: Run Gemini CLI review
         uses: google-github-actions/run-gemini-cli@v0
+        env:
+          # The checked-out CI workspace is never interactively trusted, so
+          # Gemini CLI's headless trusted-folder check must be bypassed here.
+          GEMINI_CLI_TRUST_WORKSPACE: 'true'
         with:
           gemini_api_key: ${{ secrets.GEMINI_CLI_KEY }}
           github_pr_number: ${{ github.event.pull_request.number || github.event.issue.number }}
