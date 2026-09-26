@@ -46,3 +46,9 @@ worktrees/
 .agents/worktrees/
 .typert-*/
 native/system/test/bin/
+
+# gemini-cli settings
+.gemini/
+
+# GitHub App credentials
+gha-creds-*.json
