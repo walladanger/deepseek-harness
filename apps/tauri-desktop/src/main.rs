@@ -270,11 +270,14 @@ fn terminate(mut child: Child) {
 
 /// Records the outcome of `spawn_web_profile` (`Some(child)` on success,
 /// `None` if it failed to spawn at all) into `profile.child`, unless the
-/// slot is no longer `Pending` — which only happens if `shutdown`'s bounded
-/// wait (see its doc comment) timed out before this ran. In that rare case,
-/// any spawned child is `terminate`d here instead, since `shutdown` has
-/// already returned and nothing else will ever look at this slot again.
-/// Either way, wakes any thread waiting on `child_ready`.
+/// slot is no longer `Pending`. Since `shutdown` waits unboundedly for this
+/// to run rather than giving up (see its doc comment), that should not
+/// normally be possible — this is kept as a defensive fallback, not a path
+/// this code expects to take, in case that invariant is ever broken. In
+/// that case any spawned child is `terminate`d here instead, since
+/// `shutdown` would already have returned and nothing else would ever look
+/// at this slot again. Either way, wakes any thread waiting on
+/// `child_ready`.
 ///
 /// Returns whether the child (if any) is now the slot's responsibility to
 /// stop later (`true`), as opposed to already terminated by this call
@@ -311,22 +314,21 @@ fn record_spawn_outcome(profile: &WebProfile, child: Option<Child>) -> bool {
 /// early while `Pending`, the whole app process could exit — ending that
 /// detached thread along with it — before it ever reached the point of
 /// storing or killing the child it was in the middle of creating, leaking
-/// `dsh web` with no owner left to stop it. The wait is bounded (35s, a
-/// margin over the 30s readiness timeout) purely as a safety valve against
-/// an unexpected hang; on that timeout this proceeds as if `Stopped`, and
-/// `record_spawn_outcome` independently handles a child that finishes
-/// spawning after that point.
+/// `dsh web` with no owner left to stop it.
+///
+/// This wait is deliberately unbounded, not capped at a generous margin
+/// over the 30s readiness timeout: any such cap can only ever trade one
+/// leak for a narrower one — a `Command::spawn()` call that itself hangs
+/// past the cap (an unresponsive path for a `DSH_CLI_PATH` override, say)
+/// would let this return before `record_spawn_outcome` ever ran, exactly
+/// the leak this exists to prevent. An actually-hung `spawn()` already
+/// means the whole app is stuck; waiting here for however long that takes
+/// is an accepted cost for never returning "stopped" while that may not yet
+/// be true.
 fn shutdown(profile: &State<WebProfile>) {
     let mut guard = profile.child.lock().expect("web profile mutex poisoned");
     while matches!(*guard, ChildSlot::Pending) {
-        let (next, result) = profile
-            .child_ready
-            .wait_timeout(guard, Duration::from_secs(35))
-            .expect("web profile mutex poisoned");
-        guard = next;
-        if result.timed_out() {
-            break;
-        }
+        guard = profile.child_ready.wait(guard).expect("web profile mutex poisoned");
     }
     let previous = std::mem::replace(&mut *guard, ChildSlot::Stopped);
     drop(guard);
@@ -335,7 +337,7 @@ fn shutdown(profile: &State<WebProfile>) {
     }
 }
 
-const LOADING_HTML: &str = "data:text/html,\
+const LOADING_HTML: &str = "data:text/html;charset=utf-8,\
 <!doctype html><html><body style='background:%23111;color:%23eee;\
 font-family:sans-serif;display:flex;align-items:center;\
 justify-content:center;height:100vh;margin:0'>\
@@ -386,7 +388,7 @@ fn encode_message(message: &str) -> String {
 /// [`encode_message`].
 fn message_page(message: &str) -> String {
     format!(
-        "data:text/html,<!doctype html><html><body style='background:%23111;color:%23eee;\
+        "data:text/html;charset=utf-8,<!doctype html><html><body style='background:%23111;color:%23eee;\
          font-family:sans-serif;padding:2rem;white-space:pre-wrap'><p>{}</p></body></html>",
         encode_message(message)
     )
@@ -436,6 +438,15 @@ fn main() {
     let port = env::var("DSH_WEB_PORT").unwrap_or_else(|_| "5175".to_string());
 
     tauri::Builder::default()
+        // Must be the first plugin registered (tauri-plugin-single-instance's
+        // own requirement). Without this, launching the installed executable
+        // a second time starts a second `dsh web` competing for the same
+        // default port instead of focusing the already-open window.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.set_focus();
+            }
+        }))
         .manage(WebProfile { child: Mutex::new(ChildSlot::Pending), child_ready: Condvar::new() })
         .setup(move |app: &mut tauri::App| {
             WebviewWindowBuilder::new(app, "main", WebviewUrl::External(LOADING_HTML.parse()?))
@@ -454,14 +465,32 @@ fn main() {
                         let (captured_stderr, stderr_done) = spawn_stderr_capture(stderr);
 
                         if !record_spawn_outcome(&profile, Some(child)) {
-                            // shutdown()'s bounded wait timed out before this
-                            // resolved and it has already returned; the child
-                            // was terminated inside record_spawn_outcome, and
-                            // there is nothing left to navigate to.
+                            // Should not happen (shutdown() waits unboundedly
+                            // for this to run) — see record_spawn_outcome's
+                            // doc comment. The child was terminated inside
+                            // it regardless, and there is nothing left to
+                            // navigate to.
                             return;
                         }
-                        wait_for_ready_url(&profile, stdout, Duration::from_secs(30))
-                            .unwrap_or_else(|| startup_failure_page(&captured_stderr, &stderr_done))
+                        match wait_for_ready_url(&profile, stdout, Duration::from_secs(30)) {
+                            Some(url) => url,
+                            None => {
+                                // Startup failed outright, or timed out with
+                                // dsh still running: either way, stop it
+                                // rather than leaving it running with no way
+                                // to ever reach it — a URL announced after
+                                // this point would have nowhere to go, since
+                                // nothing is still reading stdout for it.
+                                let previous = std::mem::replace(
+                                    &mut *profile.child.lock().expect("web profile mutex poisoned"),
+                                    ChildSlot::Stopped,
+                                );
+                                if let ChildSlot::Running(child) = previous {
+                                    terminate(child);
+                                }
+                                startup_failure_page(&captured_stderr, &stderr_done)
+                            }
+                        }
                     }
                     Err(error) => {
                         record_spawn_outcome(&profile, None);

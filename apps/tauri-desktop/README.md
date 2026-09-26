@@ -13,7 +13,10 @@ workspace, and is excluded from the pnpm workspace and the `dsh` launch
 surface it wraps.
 
 It is being evaluated alongside the existing Electron-based `apps/desktop`;
-neither replaces the other yet.
+neither replaces the other yet. Its product name is deliberately distinct
+("DeepSeek Harness (Tauri Preview)") so installing it alongside `apps/desktop`
+does not collide with — or overwrite — that app's Start-menu shortcut and
+installer identity, both of which use the plain "DeepSeek Harness" name.
 
 ## Launch policy
 
@@ -72,7 +75,7 @@ than fixed:
   [Tauri Desktop Installer workflow](../../.github/workflows/tauri-desktop-installer.yml)
   produces an MSI and an NSIS `.exe` installer via `tauri-action`; after
   installing, `scripts/Run-DshDesktop.ps1` finds the installed executable
-  under `%LOCALAPPDATA%\DeepSeek Harness\` automatically.
+  under `%LOCALAPPDATA%\DeepSeek Harness (Tauri Preview)\` automatically.
 
 ## Development
 

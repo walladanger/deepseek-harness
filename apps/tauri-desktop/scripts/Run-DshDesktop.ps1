@@ -88,9 +88,9 @@ if ($Stop) {
 }
 
 if (-not $ExePath) {
-    $installed = Join-Path $env:LOCALAPPDATA 'DeepSeek Harness\dsh-tauri-desktop.exe'
-    $programFiles = Join-Path ${env:ProgramFiles} 'DeepSeek Harness\dsh-tauri-desktop.exe'
-    $programFilesX86 = Join-Path ${env:ProgramFiles(x86)} 'DeepSeek Harness\dsh-tauri-desktop.exe'
+    $installed = Join-Path $env:LOCALAPPDATA 'DeepSeek Harness (Tauri Preview)\dsh-tauri-desktop.exe'
+    $programFiles = Join-Path ${env:ProgramFiles} 'DeepSeek Harness (Tauri Preview)\dsh-tauri-desktop.exe'
+    $programFilesX86 = Join-Path ${env:ProgramFiles(x86)} 'DeepSeek Harness (Tauri Preview)\dsh-tauri-desktop.exe'
     $localBuild = Join-Path $PSScriptRoot '..\target\release\dsh-tauri-desktop.exe'
     $candidates = @($installed, $programFiles, $programFilesX86)
     $found = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
