@@ -67,10 +67,16 @@ clean up: neither signal reaches Tauri's own window-close handling, and
 `dsh` would not receive a terminal's Ctrl-C either, so without this handler
 it would keep running, bound to its port, after the shell itself was gone.
 
+A link within the dsh UI that targets somewhere outside its own origin — an
+account-authorization link, a chat citation — opens in the platform's
+default browser instead of navigating this window away from the app or
+opening a second in-app window, the same disposition `apps/desktop`'s
+Electron shell gives such links.
+
 ## Known limitations
 
-This is an early evaluation shell, and two gaps are accepted for now rather
-than fixed:
+This is an early evaluation shell, and three gaps are accepted for now
+rather than fixed:
 
 - No live monitoring of the running `dsh web` process: if it crashes after
   the window has already loaded it, the window is simply left showing a
@@ -78,6 +84,16 @@ than fixed:
 - No workspace picker: `DSH_WEB_WORKSPACE` (or the home-directory default)
   is fixed for the process's lifetime; there is no in-app way to choose or
   change it.
+- `Run-DshDesktop.ps1 -Stop`'s 10s forced-`taskkill` fallback (used only
+  when a normal window close doesn't close the process in time) can race
+  an in-flight `Command::spawn()` this shell is itself blocked waiting on
+  (see the unbounded-wait note above): if that spawn resolves after
+  `taskkill /T` has already enumerated the process tree but before it
+  finishes killing it, the newly created `dsh` can survive as an orphan.
+  This is inherent to forcibly killing a process tree from outside while a
+  spawn inside it is still in flight, not something the fallback's own
+  logic can close; it needs the same unresponsive `DSH_CLI_PATH` condition
+  as that unbounded wait, on top of adverse timing, to occur at all.
 
 ## Use
 

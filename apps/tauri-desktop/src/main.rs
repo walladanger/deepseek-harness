@@ -202,7 +202,17 @@ fn parse_ready_url(line: &str, expected_port: &str) -> Option<String> {
     if announced_port.is_empty() || (expected_port != "0" && announced_port != expected_port) {
         return None;
     }
-    (rest.is_empty() || rest.starts_with('/') || rest.starts_with('?')).then(|| candidate.to_string())
+    // Requires a nonempty `token` query value, not just a `?`-prefixed rest:
+    // `packages/client/connection/src/browser-auth.ts`'s `authenticatedUrl`
+    // always sets exactly this query parameter on the real announcement, and
+    // the bare index route 401s without it. Accepting any `?`-prefixed (or
+    // empty/path-only) rest would let a same-looking but unauthenticated line
+    // — printed by some other startup plugin before the real announcement,
+    // say — be mistaken for readiness, latching the window onto a URL that
+    // can never load, with the real announcement then discarded unread.
+    rest.split('?').nth(1)?.split('&').any(|pair| {
+        pair.strip_prefix("token=").is_some_and(|value| !value.is_empty())
+    }).then(|| candidate.to_string())
 }
 
 /// Reads `stderr` on a dedicated thread into a bounded buffer, returning a
@@ -402,9 +412,14 @@ fn terminate(mut child: Child) {
             .arg("/F")
             .status();
     } else {
+        // `--` ends option parsing before the negative group id: without it,
+        // some `kill` implementations (util-linux's, notably) parse a bare
+        // `-<pgid>` as an unrecognized option rather than the PID operand,
+        // so the command silently targets nothing while still exiting 0 —
+        // every signal below would then be a no-op that looks like success.
         let group = format!("-{}", child.id());
         if !leader_exited {
-            let _ = Command::new("kill").arg("-TERM").arg(&group).status();
+            let _ = Command::new("kill").arg("-TERM").arg("--").arg(&group).status();
             wait_for_exit(&mut child, Duration::from_secs(5));
         }
         // Escalate based on whether the *group* is empty, not just whether
@@ -416,9 +431,10 @@ fn terminate(mut child: Child) {
         // without a process-listing API. This runs even when the leader had
         // already exited before this call started: a surviving descendant
         // is exactly the case a leader-only check would miss.
-        let group_alive = Command::new("kill").arg("-0").arg(&group).status().is_ok_and(|status| status.success());
+        let group_alive =
+            Command::new("kill").arg("-0").arg("--").arg(&group).status().is_ok_and(|status| status.success());
         if group_alive {
-            let _ = Command::new("kill").arg("-KILL").arg(&group).status();
+            let _ = Command::new("kill").arg("-KILL").arg("--").arg(&group).status();
         }
         // Belt and braces: ensure the direct child itself is reaped even if
         // the group-targeted kill above failed for some reason, or was
@@ -662,8 +678,49 @@ fn install_unix_signal_shutdown(handle: AppHandle) {
 #[cfg(not(unix))]
 fn install_unix_signal_shutdown(_handle: AppHandle) {}
 
+/// Opens `url` in the platform's default browser, the same way clicking an
+/// external link in [`apps/desktop`'s Electron shell](../../desktop) does
+/// via Electron's `shell.openExternal`. No equivalent exists inside a bare
+/// webview, so this shells out to each platform's own opener directly
+/// rather than pulling in a plugin for a one-line, non-configurable action.
+fn open_in_system_browser(url: &str) {
+    let result = if cfg!(target_os = "windows") {
+        // `start`'s first argument is its (optional, quoted) window title,
+        // not part of the target; an empty title argument is required so
+        // `url` itself isn't misread as one.
+        no_console_window(Command::new("cmd")).arg("/C").arg("start").arg("").arg(url).status()
+    } else if cfg!(target_os = "macos") {
+        Command::new("open").arg(url).status()
+    } else {
+        Command::new("xdg-open").arg(url).status()
+    };
+    if let Err(error) = result {
+        eprintln!("dsh-tauri-desktop: failed to open {url} in the system browser: {error}");
+    }
+}
+
+/// Whether `url` is safe to load inside the shell's own window: either one
+/// of its own `data:` placeholder/diagnostic pages, or the dsh web origin
+/// `allowed_origin` currently holds (set once the readiness worker knows
+/// it — see [`main`]). Anything else (an account-authorization link, a chat
+/// citation, `window.open()` from dsh's own UI) is a link to the wider web
+/// that this single-window shell has nowhere else to show, and is routed to
+/// the system browser via [`open_in_system_browser`] instead — the same
+/// disposition `apps/desktop`'s Electron shell gives such links.
+fn should_load_in_window(url: &tauri::Url, allowed_origin: &Mutex<Option<String>>) -> bool {
+    if url.scheme() == "data" {
+        return true;
+    }
+    let allowed = allowed_origin.lock().expect("allowed-origin mutex poisoned");
+    allowed.as_deref() == Some(url.origin().ascii_serialization().as_str())
+}
+
 fn main() {
     let port = env::var("DSH_WEB_PORT").unwrap_or_else(|_| "5175".to_string());
+    // Set once the readiness worker below learns the exact origin dsh web
+    // announced; read by `should_load_in_window` to tell that origin's own
+    // navigations apart from links out to the wider web.
+    let allowed_origin: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
     tauri::Builder::default()
         // Must be the first plugin registered (tauri-plugin-single-instance's
@@ -677,10 +734,31 @@ fn main() {
         }))
         .manage(WebProfile { child: Mutex::new(ChildSlot::Pending), child_ready: Condvar::new() })
         .setup(move |app: &mut tauri::App| {
+            let navigation_origin = Arc::clone(&allowed_origin);
+            let readiness_origin = Arc::clone(&allowed_origin);
             WebviewWindowBuilder::new(app, "main", WebviewUrl::External(LOADING_HTML.parse()?))
                 .title("DeepSeek Harness")
                 .inner_size(1280.0, 860.0)
                 .min_inner_size(800.0, 600.0)
+                // Same-webview navigation (a plain link, `window.location`)
+                // away from dsh's own origin: open it externally instead of
+                // letting this single window navigate away from the app.
+                .on_navigation(move |url| {
+                    if should_load_in_window(url, &navigation_origin) {
+                        true
+                    } else {
+                        open_in_system_browser(url.as_str());
+                        false
+                    }
+                })
+                // `target="_blank"` links and `window.open()` (dsh's own
+                // account-authorization and chat-citation links use both)
+                // request a *new* window rather than navigating this one,
+                // so `on_navigation` above never sees them.
+                .on_new_window(move |url, _features| {
+                    open_in_system_browser(url.as_str());
+                    tauri::webview::NewWindowResponse::Deny
+                })
                 .build()?;
 
             install_unix_signal_shutdown(app.handle().clone());
@@ -723,11 +801,18 @@ fn main() {
                     }
                 };
                 if let Some(window) = handle.get_webview_window("main") {
-                    let target = url.parse().unwrap_or_else(|error| {
+                    let target: tauri::Url = url.parse().unwrap_or_else(|error| {
                         message_page(&format!("dsh web announced an unparseable URL ({error}): {url}"))
                             .parse()
                             .expect("message_page always produces a well-formed data: URL")
                     });
+                    // Set before navigating, not after: `should_load_in_window`
+                    // must already recognize this origin by the time the
+                    // navigation it gates for this very URL is evaluated.
+                    if target.scheme() != "data" {
+                        *readiness_origin.lock().expect("allowed-origin mutex poisoned") =
+                            Some(target.origin().ascii_serialization());
+                    }
                     let _ = window.navigate(target);
                 }
             });
