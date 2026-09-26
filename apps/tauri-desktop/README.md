@@ -18,24 +18,47 @@ neither replaces the other yet.
 ## Launch policy
 
 The shell never launches the harness itself outside a `dsh` profile: at
-startup it spawns `dsh --profile web --host <host> --port <port> --no-open`
-(overridable via `DSH_CLI_PATH`, `DSH_WEB_HOST`, `DSH_WEB_PORT`) and holds
-that child process for its own lifetime. The harness process itself is
-always started through the `web` profile, per
+startup it spawns `dsh --profile web --host 127.0.0.1 --port <port> --no-open`
+(overridable via `DSH_CLI_PATH`, `DSH_WEB_PORT`) in a working directory
+(overridable via `DSH_WEB_WORKSPACE`, otherwise the current user's home
+directory) and holds that child process for its own lifetime. `127.0.0.1`
+is not configurable: `dsh web`'s own configuration schema accepts only that
+or `0.0.0.0`, and the CLI itself refuses `0.0.0.0` for safety, so it is not
+a real setting. The harness process itself is always started through the
+`web` profile, per
 [`docs/architecture.md#application-launch`](../../docs/architecture.md#application-launch).
 
 The window shows a short "Starting…" placeholder while it waits (up to 30s)
 for `dsh web` to announce its authenticated launch URL on stdout, then
-navigates to that exact URL. A bare `http://<host>:<port>` is not usable
+navigates to that exact URL. A bare `http://127.0.0.1:<port>` is not usable
 here: the index route requires the process token or session cookie carried
 in that announced URL, and rejects a plain request with 401 (see
 [`dsh-host-frontend-static`](../../packages/host/frontend-static/README.md)).
+If `dsh web` exits without ever announcing that URL, the window instead
+shows whatever it wrote to stderr (its own actionable cause), falling back
+to a generic timeout message if it wrote nothing.
 
 On window close or app exit, the shell asks the child to stop gracefully
 (`SIGTERM` on Unix, `taskkill` without `/F` on Windows) and gives it 5s to
 exit — so the CLI can run its normal shutdown path — before force-killing
 it. On Windows the child is `cmd.exe` (see below), so termination targets
-its whole process tree (`taskkill /T`), not just that one process.
+its whole process tree (`taskkill /T`), not just that one process. A
+shutdown request that arrives while `dsh` is still in the process of
+spawning blocks (briefly, bounded) until that spawn resolves, rather than
+finding nothing yet to stop and returning while a child could still end up
+running unmanaged.
+
+## Known limitations
+
+This is an early evaluation shell, and two gaps are accepted for now rather
+than fixed:
+
+- No live monitoring of the running `dsh web` process: if it crashes after
+  the window has already loaded it, the window is simply left showing a
+  disconnected page, with no restart or failure UI.
+- No workspace picker: `DSH_WEB_WORKSPACE` (or the home-directory default)
+  is fixed for the process's lifetime; there is no in-app way to choose or
+  change it.
 
 ## Use
 

@@ -20,13 +20,19 @@
     Optional path to the `dsh` executable/script the shell should launch.
     Passed through as DSH_CLI_PATH; omit to resolve `dsh` from PATH.
 
-.PARAMETER WebHost
-    Loopback host the wrapped web profile binds to. Default 127.0.0.1.
-    Aliased as -Host for convenience; $Host is a reserved PowerShell
-    automatic variable, so the parameter itself cannot be named Host.
-
 .PARAMETER Port
-    Port the wrapped web profile binds to. Default 5175.
+    Port the wrapped web profile binds to. Default 5175. There is no host
+    parameter: dsh web's own configuration schema accepts only 127.0.0.1 as
+    a working value (0.0.0.0 is schema-valid but the CLI itself refuses it
+    for safety), so the shell always uses 127.0.0.1 and does not expose a
+    setting that could only ever be set to its own default.
+
+.PARAMETER Workspace
+    Directory dsh web treats as its session workspace root. Passed through
+    as DSH_WEB_WORKSPACE; defaults (in the shell itself) to the current
+    user's home directory if omitted, rather than inheriting whatever
+    working directory the shell's own launch happened to use (typically the
+    install directory when launched from a shortcut or Explorer).
 
 .PARAMETER Stop
     Close a running dsh-tauri-desktop.exe instance's window instead of
@@ -47,8 +53,7 @@
 param(
     [string]$ExePath,
     [string]$DshCliPath,
-    [Alias('Host')]
-    [string]$WebHost = '127.0.0.1',
+    [string]$Workspace,
     [string]$Port = '5175',
     [switch]$Stop
 )
@@ -107,11 +112,13 @@ if (Get-Process -Name $processName -ErrorAction SilentlyContinue) {
     exit 0
 }
 
-$env:DSH_WEB_HOST = $WebHost
 $env:DSH_WEB_PORT = $Port
 if ($DshCliPath) {
     $env:DSH_CLI_PATH = $DshCliPath
 }
+if ($Workspace) {
+    $env:DSH_WEB_WORKSPACE = $Workspace
+}
 
 Start-Process -FilePath $ExePath
-Write-Host "Started $processName (web profile bound to ${WebHost}:${Port}; the shell navigates its own window to dsh web's announced, authenticated URL)."
+Write-Host "Started $processName (web profile bound to 127.0.0.1:${Port}; the shell navigates its own window to dsh web's announced, authenticated URL)."
