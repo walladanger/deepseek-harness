@@ -39,6 +39,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
+          # A pull_request event's default ref (refs/pull/N/merge) is never
+          # generated for a PR with merge conflicts, which would fail this
+          # checkout before "Check out the PR head" below ever replaces it
+          # with the real head anyway; check out the base branch here
+          # instead, on both trigger paths.
+          ref: ${{ github.event.repository.default_branch }}
           fetch-depth: 0
 
       # A fork PR's own package.json scripts, Makefile, or repository

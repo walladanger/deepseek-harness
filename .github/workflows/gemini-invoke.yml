@@ -89,8 +89,12 @@ jobs:
           GEMINI_CLI_TRUST_WORKSPACE: 'true'
         with:
           gemini_api_key: ${{ secrets.GEMINI_CLI_KEY }}
+          # '' && '' || y evaluates '' as falsy the same as the object it
+          # replaces would be, so github_issue_number's truthy branch can't
+          # be '' the way github_pr_number's falsy branch is; negate the
+          # condition instead so the truthy branch is always the number.
           github_pr_number: ${{ github.event.issue.pull_request && github.event.issue.number || '' }}
-          github_issue_number: ${{ github.event.issue.pull_request && '' || github.event.issue.number }}
+          github_issue_number: ${{ !github.event.issue.pull_request && github.event.issue.number || '' }}
           prompt: |
             You were mentioned as @gemini-cli in a comment on
             ${{ github.event.issue.pull_request && 'pull request' || 'issue' }}
