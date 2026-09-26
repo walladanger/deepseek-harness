@@ -8,7 +8,10 @@ on:
 
 concurrency:
   group: gemini-pr-review-${{ github.event.pull_request.number || github.event.issue.number }}
-  cancel-in-progress: false
+  # A newer push or comment supersedes an in-flight review of a stale
+  # diff; queuing every push instead would burn API quota on reviews
+  # nobody reads.
+  cancel-in-progress: true
 
 jobs:
   review:
@@ -42,11 +45,16 @@ jobs:
                 github.ref }}
           fetch-depth: 0
 
-      # The checked-out ref may be an external fork's head, whose .gemini/
-      # and .env content Gemini CLI would otherwise load and execute with
-      # this job's GEMINI_CLI_KEY in scope.
-      - name: Remove untrusted workspace configuration
-        run: rm -rf .gemini .env
+      # Gemini CLI auto-loads .gemini/, .env, GEMINI.md (and nested
+      # GEMINI.md), and .agents/skills/*/SKILL.md as trusted instructions
+      # and tool configuration. The checked-out ref may be an external
+      # fork's head, so restore master's copies of the instruction
+      # surfaces rather than trusting whatever the PR itself carries.
+      - name: Reset agent-instruction surfaces to master's trusted copies
+        run: |
+          rm -rf .gemini .env
+          git fetch origin master
+          git checkout origin/master -- GEMINI.md .agents/ 2>/dev/null || true
 
       - name: Run Gemini CLI review
         uses: google-github-actions/run-gemini-cli@v0
@@ -54,6 +62,10 @@ jobs:
           # The checked-out CI workspace is never interactively trusted, so
           # Gemini CLI's headless trusted-folder check must be bypassed here.
           GEMINI_CLI_TRUST_WORKSPACE: 'true'
+          # run-gemini-cli does not post PR review comments itself; the
+          # agent's own `gh pr review`/`gh pr comment` calls need a token.
+          GITHUB_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ github.token }}
         with:
           gemini_api_key: ${{ secrets.GEMINI_CLI_KEY }}
           github_pr_number: ${{ github.event.pull_request.number || github.event.issue.number }}

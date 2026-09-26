@@ -29,23 +29,49 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          # A PR comment's default checkout is the base branch; check out the
-          # PR's own head so a requested fix has something to commit onto.
-          ref: >-
-            ${{ github.event.issue.pull_request &&
-                format('refs/pull/{0}/head', github.event.issue.number) ||
-                github.ref }}
+          fetch-depth: 0
+
+      # A PR whose head is an external fork gets write-access execution
+      # over its own untrusted content otherwise: pre-commit hooks,
+      # package.json scripts, and the agent's own commit/push all run
+      # against that fork's tree with this job's contents:write permission.
+      - name: Verify the PR head is this repository's own branch
+        if: ${{ github.event.issue.pull_request }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          head_repo=$(gh pr view "${{ github.event.issue.number }}" --json headRepository --jq '.headRepository.name')
+          head_owner=$(gh pr view "${{ github.event.issue.number }}" --json headRepositoryOwner --jq '.headRepositoryOwner.login')
+          if [ "${head_owner}/${head_repo}" != "${{ github.repository }}" ]; then
+            echo "::error::PR #${{ github.event.issue.number }} head is an external fork (${head_owner}/${head_repo}); gemini-invoke does not run against fork checkouts."
+            exit 1
+          fi
+
+      # A checkout of refs/pull/N/head lands in detached HEAD, so `git push`
+      # to "the current branch" has nothing to push to; check out the PR's
+      # actual named branch instead.
+      - name: Check out the PR branch
+        if: ${{ github.event.issue.pull_request }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh pr checkout ${{ github.event.issue.number }}
 
       - name: Configure git identity for commits
         run: |
           git config user.name "gemini-cli[bot]"
           git config user.email "gemini-cli[bot]@users.noreply.github.com"
 
-      # The checked-out ref may be an external fork's head, whose .gemini/
-      # and .env content Gemini CLI would otherwise load and execute with
-      # this job's contents:write permissions and GEMINI_CLI_KEY in scope.
-      - name: Remove untrusted workspace configuration
-        run: rm -rf .gemini .env
+      # Gemini CLI auto-loads .gemini/, .env, GEMINI.md (and nested
+      # GEMINI.md), and .agents/skills/*/SKILL.md as trusted instructions
+      # and tool configuration; on a checkout this job already verified is
+      # this repository's own branch, restoring master's copies still
+      # guards against a compromised or stale branch carrying hostile
+      # variants of those files.
+      - name: Reset agent-instruction surfaces to master's trusted copies
+        run: |
+          rm -rf .gemini .env
+          git fetch origin master
+          git checkout origin/master -- GEMINI.md .agents/ 2>/dev/null || true
 
       - name: Run Gemini CLI
         uses: google-github-actions/run-gemini-cli@v0
@@ -53,6 +79,10 @@ jobs:
           # The checked-out CI workspace is never interactively trusted, so
           # Gemini CLI's headless trusted-folder check must be bypassed here.
           GEMINI_CLI_TRUST_WORKSPACE: 'true'
+          # run-gemini-cli does not post PR comments or drive git itself;
+          # the agent's own `gh`/`git` tool calls need an authenticated token.
+          GITHUB_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ github.token }}
         with:
           gemini_api_key: ${{ secrets.GEMINI_CLI_KEY }}
           github_pr_number: ${{ github.event.issue.pull_request && github.event.issue.number || '' }}
