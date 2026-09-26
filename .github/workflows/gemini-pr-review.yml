@@ -1,0 +1,38 @@
+name: Gemini PR Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  issue_comment:
+    types: [created]
+
+concurrency:
+  group: gemini-pr-review-${{ github.event.pull_request.number || github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  review:
+    if: >-
+      github.event_name == 'pull_request' ||
+      (github.event.issue.pull_request != null &&
+       contains(github.event.comment.body, '@gemini-cli') &&
+       contains(github.event.comment.body, '/review'))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run Gemini CLI review
+        uses: google-github-actions/run-gemini-cli@v0
+        with:
+          gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
+          github_pr_number: ${{ github.event.pull_request.number || github.event.issue.number }}
+          prompt: |
+            You are reviewing pull request #${{ github.event.pull_request.number || github.event.issue.number }}
+            in this repository. Fetch the diff, review it for correctness bugs, security issues, and
+            deviations from this repository's AGENTS.md conventions. Post your findings as a single PR
+            review comment. Do not push any code changes in this workflow — comment only.
