@@ -83,7 +83,7 @@ file handler or an arbitrary installed application.
 
 ## Known limitations
 
-This is an early evaluation shell, and three gaps are accepted for now
+This is an early evaluation shell, and four gaps are accepted for now
 rather than fixed:
 
 - No live monitoring of the running `dsh web` process: if it crashes after
