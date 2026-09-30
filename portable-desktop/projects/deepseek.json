@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "id": "deepseek",
+  "name": "DeepSeek Harness",
+  "shortcutName": "DeepSeek Harness (Frameless)",
+  "repository": "deepseek-ai/deepseek-harness",
+  "ref": "master",
+  "nodeMajor": 24,
+  "buildTools": false,
+  "installCommands": [
+    ["install", "--frozen-lockfile", "--fetch-timeout=600000", "--network-concurrency=4"],
+    ["run", "build"]
+  ],
+  "launchArguments": ["dsh", "web", "--host", "127.0.0.1", "--port", "0", "--no-open"],
+  "readinessPrefix": "dsh web: ",
+  "requireToken": true
+}

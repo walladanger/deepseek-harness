@@ -1,0 +1,5 @@
+:root { color-scheme: dark; font: 16px/1.6 "Segoe UI", sans-serif; background: #11151c; color: #edf0f5; }
+body { margin: 0; }
+main { max-width: 700px; margin: 14vh auto; padding: 24px; }
+h1 { font-size: 24px; font-weight: 600; }
+p { color: #b7c1cf; }

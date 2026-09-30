@@ -1,0 +1,6 @@
+{
+  "identifier": "shell-chrome",
+  "description": "Local title strip can receive backend status. The application view receives no Tauri permissions.",
+  "webviews": ["chrome"],
+  "permissions": ["core:event:allow-listen", "core:event:allow-unlisten"]
+}

@@ -1,0 +1,6 @@
+/bin/
+/installed/
+/tmp/
+/shell/target/
+/shell/gen/
+/*.zip

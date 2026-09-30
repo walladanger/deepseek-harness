@@ -1,0 +1,42 @@
+name: Portable desktop wrapper
+
+on:
+  push:
+    branches: ['codex/reusable-desktop-wrapper']
+    paths: ['portable-desktop/**', '.github/workflows/portable-desktop.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Rust behavior tests
+        working-directory: portable-desktop/shell
+        run: cargo test --locked
+      - name: Build the reusable Windows shell
+        shell: powershell
+        run: ./portable-desktop/Build-Shell.ps1
+      - name: Executable HTTP and cleanup checks
+        shell: powershell
+        run: ./portable-desktop/Test-Wrapper.ps1
+      - name: Installer archive checks
+        shell: powershell
+        run: ./portable-desktop/Test-Install.ps1
+      - name: Package a bundle with the compiled shell
+        shell: powershell
+        run: |
+          $bundle = Join-Path $env:RUNNER_TEMP 'portable-desktop'
+          ./portable-desktop/Package.ps1 -Destination $bundle -Archive portable-desktop-windows-x64.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: portable-desktop-windows-x64
+          path: portable-desktop-windows-x64.zip
+          if-no-files-found: error

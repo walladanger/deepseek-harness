@@ -1,0 +1,11 @@
+:root { color-scheme: dark; font-family: "Segoe UI", sans-serif; background: #191c22; color: #edf0f5; }
+* { box-sizing: border-box; }
+body { margin: 0; overflow: hidden; }
+header { height: 40px; display: flex; align-items: stretch; user-select: none; }
+#drag { flex: 1; min-width: 0; display: flex; align-items: center; gap: 18px; padding: 0 14px; }
+#name { white-space: nowrap; font-size: 13px; font-weight: 600; }
+#status { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; color: #b7c1cf; font-size: 12px; }
+#status.failed { color: #ffb4a9; }
+button { width: 46px; border: 0; background: transparent; color: inherit; font-size: 18px; cursor: pointer; }
+button:hover, button:focus-visible { background: #353b47; }
+#close:hover { background: #c42b1c; }
