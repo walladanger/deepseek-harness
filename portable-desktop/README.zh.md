@@ -104,6 +104,8 @@ Microsoft WebView2 是 Windows 运行时前提。缺失时，安装程序下载�
 
 桌面快捷方式必然位于文件夹之外。后续 DeepSeek 工具或插件所需的依赖可能还有额外系统要求。用户选择的工作区也可位于此安装目录之外。Git 忽略运行时数据、凭据和下载的构建。
 
+打开 Web UI 不需要发起模型 API 请求。运行代理会话前，请通过 DeepSeek 自身的配置界面设置所选模型提供者的账号或 API 凭据，并确保可以访问该提供者的网络服务。默认本地凭据存储写入 `DSH_HOME` 下，在此为 `data/dsh-home`；凭据配置与临时回环启动令牌相互独立。包装器不提供模型密钥，也不安装本地语言模型。DeepSeek 中启用的工具可能还需要各自的程序、凭据和工作区权限。
+
 <a id="startup-and-shutdown"></a>
 
 ## 启动和关闭
@@ -149,6 +151,20 @@ sequenceDiagram
 Windows 后端以挂起状态启动，先加入外壳拥有的 Windows Job，再恢复执行。关闭或退出外壳时释放该 Job，终止整个后端进程树。这是强制终止，不是 DeepSeek 的正常关闭协议。启动超时和进程退出也会停止其拥有的后端。就绪后的后端失败会显示在标题条中。
 
 外壳接受环回 HTTP 就绪 URL，拒绝外部来源和格式错误的令牌 URL，并通过 Windows URL 处理程序打开外部 HTTP(S) 引用或授权链接。捕获的 stdout 日志会隐藏启动 URL 查询参数。后端环境移除名称含 KEY、SECRET、TOKEN 或 PASSWORD 的继承环境变量；通过 DeepSeek 原始 UI 和目录内 Harness 主目录配置凭据。
+
+```mermaid
+flowchart LR
+  User["Session input in original Web UI"] --> Backend["Local Harness backend"]
+  Backend --> Provider["Configured remote model provider"]
+  Provider --> Backend
+  Backend --> Tools["Enabled tools and selected workspace"]
+  Tools --> Backend
+  Backend --> Store["Contained sessions, settings and credentials"]
+  Backend --> Events["Results and session updates"]
+  Events --> User
+```
+
+包装器管理窗口和后端生命周期。DeepSeek 负责会话执行、提供者请求、工具选择和持久化。Web UI 将用户操作提交给本地后端并显示其结果；模型提供者连接由 Harness 发起。下载上游版本会一并更新这些应用组件，包装器则保持为独立的可执行文件。
 
 <a id="verification-and-recovery"></a>
 

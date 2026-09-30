@@ -104,6 +104,8 @@ Microsoft WebView2 is a Windows runtime prerequisite. If it is missing, the inst
 
 The desktop shortcut is necessarily outside the folder. Dependencies required by later DeepSeek tools or plugins may have additional system requirements. User-selected workspaces can also live outside this installation. Runtime data, credentials and downloaded builds are ignored by Git.
 
+Opening the Web UI does not require a model API request. To run an agent session, configure the selected model provider's account or API credential through DeepSeek's own configuration UI, and provide network access to that provider. The default local credential store writes beneath `DSH_HOME`, here `data/dsh-home`; credential configuration is separate from the temporary loopback launch token. The wrapper does not supply a model key or install a local language model. Tools enabled in DeepSeek may also need their own programs, credentials, and workspace permissions.
+
 <a id="startup-and-shutdown"></a>
 
 ## Startup and shutdown
@@ -149,6 +151,20 @@ sequenceDiagram
 The Windows backend is spawned suspended, assigned to an owned Windows Job, and resumed after assignment. Closing or exiting the shell releases that Job and terminates its backend tree. This is forced termination, not DeepSeek's graceful shutdown protocol. Startup timeouts and process exits also stop the owned backend. Backend failure after readiness is reported in the title strip.
 
 The shell accepts loopback HTTP readiness URLs, rejects foreign origins and malformed token URLs, and opens external HTTP(S) citations or authorization links through Windows' URL handler. Launch URL queries are redacted in the captured stdout log. Ambient environment variables whose names contain KEY, SECRET, TOKEN or PASSWORD are removed from the backend environment; configure DeepSeek credentials through its original UI and contained Harness home.
+
+```mermaid
+flowchart LR
+  User["Session input in original Web UI"] --> Backend["Local Harness backend"]
+  Backend --> Provider["Configured remote model provider"]
+  Provider --> Backend
+  Backend --> Tools["Enabled tools and selected workspace"]
+  Tools --> Backend
+  Backend --> Store["Contained sessions, settings and credentials"]
+  Backend --> Events["Results and session updates"]
+  Events --> User
+```
+
+The shell manages the window and backend lifetime. DeepSeek owns session execution, provider requests, tool selection and persistence. The Web UI submits user actions to that local backend and displays its results; the model provider connection originates from Harness. Downloading an upstream revision updates those application components together, while the wrapper remains a separate executable.
 
 <a id="verification-and-recovery"></a>
 
