@@ -44,3 +44,5 @@ catch { if ($_.Exception.Message -notlike '*exit code 7*') { throw }; $failed = 
 $output = [IO.File]::ReadAllText($nativeLog)
 if (-not $failed -or $output -notmatch 'stdout evidence' -or $output -notmatch 'stderr evidence' -or $output -notmatch 'nonzero evidence') { throw 'Native exit checks or diagnostic capture failed.' }
 Write-Host 'PASS: native stdout, stderr, and nonzero exit behavior'
+# The expected native exit 7 was asserted above; callers must receive the suite's successful exit.
+exit 0
