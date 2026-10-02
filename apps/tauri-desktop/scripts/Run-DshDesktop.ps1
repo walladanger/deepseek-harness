@@ -1,0 +1,159 @@
+#Requires -Version 5.1
+<#
+.SYNOPSIS
+    Runs the DSH Tauri desktop shell.
+
+.DESCRIPTION
+    Launches the built `dsh-tauri-desktop.exe` (installed by the MSI/NSIS
+    installer, or a locally built binary). The shell shows a single normal
+    window with the dsh web UI; it spawns and owns `dsh --profile web` in
+    the background for its lifetime and stops it when the window closes.
+    Use -Stop to close a running instance's window (triggering its normal
+    shutdown, which stops the wrapped `dsh` process) rather than killing it.
+
+.PARAMETER ExePath
+    Path to dsh-tauri-desktop.exe. Defaults to the standard per-user install
+    location, then the default WiX MSI (Program Files) location, then a
+    local release build under target/release.
+
+.PARAMETER DshCliPath
+    Optional path to the `dsh` executable/script the shell should launch.
+    Passed through as DSH_CLI_PATH; omit to resolve `dsh` from PATH.
+
+.PARAMETER Port
+    Port the wrapped web profile binds to. Default 5175. There is no host
+    parameter: dsh web's own configuration schema accepts only 127.0.0.1 as
+    a working value (0.0.0.0 is schema-valid but the CLI itself refuses it
+    for safety), so the shell always uses 127.0.0.1 and does not expose a
+    setting that could only ever be set to its own default.
+
+.PARAMETER Workspace
+    Directory dsh web treats as its session workspace root. Passed through
+    as DSH_WEB_WORKSPACE; defaults (in the shell itself) to the current
+    user's home directory if omitted, rather than inheriting whatever
+    working directory the shell's own launch happened to use (typically the
+    install directory when launched from a shortcut or Explorer).
+
+.PARAMETER Stop
+    Close a running dsh-tauri-desktop.exe instance's window instead of
+    starting one. This triggers the shell's own close handling, which stops
+    the wrapped `dsh` process; if the window does not close within 10s, its
+    whole process tree is force-stopped as a fallback.
+
+.EXAMPLE
+    .\Run-DshDesktop.ps1
+
+.EXAMPLE
+    .\Run-DshDesktop.ps1 -Port 5180 -DshCliPath 'C:\tools\dsh\dsh.cmd'
+
+.EXAMPLE
+    .\Run-DshDesktop.ps1 -Stop
+#>
+[CmdletBinding()]
+param(
+    [string]$ExePath,
+    [string]$DshCliPath,
+    [string]$Workspace,
+    [string]$Port = '5175',
+    [switch]$Stop
+)
+
+$ErrorActionPreference = 'Stop'
+$processName = 'dsh-tauri-desktop'
+
+if ($Stop) {
+    $running = Get-Process -Name $processName -ErrorAction SilentlyContinue
+    if (-not $running) {
+        Write-Host "$processName is not running."
+        exit 0
+    }
+    foreach ($process in $running) {
+        # CloseMainWindow sends a normal close request, so the shell's own
+        # CloseRequested handler runs and stops the dsh child it owns.
+        # Stop-Process -Force would skip that handler and leak the child.
+        [void]$process.CloseMainWindow()
+    }
+    # Wait-Process -Timeout is not available in Windows PowerShell 5.1
+    # (#Requires -Version 5.1 above), so the 10s wait is polled by hand.
+    $deadline = (Get-Date).AddSeconds(10)
+    do {
+        Start-Sleep -Milliseconds 200
+        $stillRunning = Get-Process -Name $processName -ErrorAction SilentlyContinue
+    } while ($stillRunning -and (Get-Date) -lt $deadline)
+    if ($stillRunning) {
+        Write-Warning "$processName did not close within 10s; force-stopping its process tree."
+        foreach ($process in $stillRunning) {
+            # taskkill /T kills the shell's own dsh/cmd.exe/node subtree too;
+            # Stop-Process -Force would kill only the shell itself and leak them.
+            # $ErrorActionPreference does not turn taskkill's own nonzero exit
+            # into a terminating error, so its result is checked explicitly.
+            & taskkill.exe /PID $process.Id /T /F | Out-Null
+            # A nonzero exit here can mean the process exited on its own between
+            # the $stillRunning snapshot and this call (the earlier graceful
+            # CloseMainWindow request landing late, say), not that the kill
+            # failed — Get-Process confirms which before treating it as fatal.
+            if ($LASTEXITCODE -ne 0 -and (Get-Process -Id $process.Id -ErrorAction SilentlyContinue)) {
+                Write-Error "taskkill failed for PID $($process.Id) (exit code $LASTEXITCODE); $processName may still be running."
+                exit 1
+            }
+        }
+        $stillRunning = Get-Process -Name $processName -ErrorAction SilentlyContinue
+        if ($stillRunning) {
+            Write-Error "$processName is still running after taskkill reported success."
+            exit 1
+        }
+    }
+    Write-Host "Stopped $processName."
+    exit 0
+}
+
+if (-not $ExePath) {
+    $installed = Join-Path $env:LOCALAPPDATA 'DeepSeek Harness (Tauri Preview)\dsh-tauri-desktop.exe'
+    $programFiles = Join-Path ${env:ProgramFiles} 'DeepSeek Harness (Tauri Preview)\dsh-tauri-desktop.exe'
+    # ${env:ProgramFiles(x86)} is unset on 32-bit Windows; Join-Path throws on
+    # a null -Path rather than treating it as "no such candidate".
+    $programFilesX86 = if (${env:ProgramFiles(x86)}) { Join-Path ${env:ProgramFiles(x86)} 'DeepSeek Harness (Tauri Preview)\dsh-tauri-desktop.exe' } else { $null }
+    $localBuild = Join-Path $PSScriptRoot '..\target\release\dsh-tauri-desktop.exe'
+    $candidates = @($installed, $programFiles, $programFilesX86) | Where-Object { $_ }
+    $found = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+    if ($found) {
+        $ExePath = $found
+    } elseif (Test-Path $localBuild) {
+        $ExePath = (Resolve-Path $localBuild).Path
+    } else {
+        throw "dsh-tauri-desktop.exe not found. Install it or pass -ExePath explicitly. Checked: $($candidates -join ', ') and '$localBuild'."
+    }
+}
+
+if (-not (Test-Path $ExePath)) {
+    throw "ExePath '$ExePath' does not exist."
+}
+
+# Saved so a stale value from an earlier invocation in this same PowerShell
+# session (or one already present when it started) is neither silently
+# reused when the corresponding parameter is omitted here, nor left behind
+# for whatever the caller runs next in this session.
+$previousCliPath = $env:DSH_CLI_PATH
+$previousWorkspace = $env:DSH_WEB_WORKSPACE
+$previousPort = $env:DSH_WEB_PORT
+
+$env:DSH_WEB_PORT = $Port
+if ($DshCliPath) {
+    $env:DSH_CLI_PATH = $DshCliPath
+} else {
+    Remove-Item Env:\DSH_CLI_PATH -ErrorAction SilentlyContinue
+}
+if ($Workspace) {
+    $env:DSH_WEB_WORKSPACE = $Workspace
+} else {
+    Remove-Item Env:\DSH_WEB_WORKSPACE -ErrorAction SilentlyContinue
+}
+
+try {
+    Start-Process -FilePath $ExePath
+    Write-Host "Started $processName (web profile bound to 127.0.0.1:${Port}; the shell navigates its own window to dsh web's announced, authenticated URL)."
+} finally {
+    if ($null -eq $previousCliPath) { Remove-Item Env:\DSH_CLI_PATH -ErrorAction SilentlyContinue } else { $env:DSH_CLI_PATH = $previousCliPath }
+    if ($null -eq $previousWorkspace) { Remove-Item Env:\DSH_WEB_WORKSPACE -ErrorAction SilentlyContinue } else { $env:DSH_WEB_WORKSPACE = $previousWorkspace }
+    if ($null -eq $previousPort) { Remove-Item Env:\DSH_WEB_PORT -ErrorAction SilentlyContinue } else { $env:DSH_WEB_PORT = $previousPort }
+}

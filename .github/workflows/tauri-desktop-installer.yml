@@ -1,0 +1,84 @@
+# Builds the single-window Tauri desktop shell (apps/tauri-desktop) into an
+# MSI and NSIS installer. Separate from ci.yml because this is a Rust/Tauri
+# build on windows-latest, not part of the pnpm/Node workspace matrix. Called
+# from ci.yml as a reusable workflow (`needs` cannot cross workflow files, so
+# this is how its job joins ci.yml's `all-checks-passed` aggregate) and kept
+# runnable manually via workflow_dispatch.
+name: Tauri Desktop Installer
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+concurrency:
+  # Keep the called workflow distinct from its caller's concurrency group;
+  # github.workflow identifies the caller (ci.yml's "CI") inside a reusable
+  # workflow, so without this prefix this group would collide with ci.yml's
+  # own, same as build-exe-for-python-sdk.yml's identical fix.
+  group: tauri-desktop-installer-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: apps/tauri-desktop
+    shell: pwsh
+
+jobs:
+  build:
+    name: Build installer
+    # Matches ci.yml's windows-build failover selector (.github/AGENTS.md:3):
+    # DSH_CI_FAILOVER_WINDOWS retargets hosted runners onto Blacksmith or the
+    # in-house self-hosted pool, with the same Dependabot hosted fallback.
+    runs-on: >-
+      ${{ vars.DSH_CI_FAILOVER_WINDOWS == 'blacksmith' && 'blacksmith-16vcpu-windows-2025'
+          || vars.DSH_CI_FAILOVER_WINDOWS == 'selfhosted'
+          && github.event.pull_request.user.login != 'dependabot[bot]'
+          && fromJSON('["self-hosted", "dsh-win-ci", "windows"]')
+          || 'dsh-windows-2025-16core' }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build output
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            apps/tauri-desktop/target
+          key: tauri-desktop-cargo-${{ runner.os }}-${{ hashFiles('apps/tauri-desktop/Cargo.lock') }}
+          restore-keys: |
+            tauri-desktop-cargo-${{ runner.os }}-
+
+      - name: Install tauri-cli
+        run: cargo install tauri-cli --version "^2" --locked
+
+      - name: Run unit tests
+        run: cargo test
+
+      - name: Build MSI and NSIS installers
+        uses: tauri-apps/tauri-action@v0
+        with:
+          # apps/tauri-desktop is a pure Cargo crate with no package.json, so
+          # tauri-action's npx-tauri default (which expects an npm project)
+          # cannot resolve a CLI here; cargo-tauri (installed above) is used
+          # directly instead.
+          tauriScript: cargo tauri
+          projectPath: apps/tauri-desktop
+          args: --bundles msi,nsis
+
+      - name: Upload installers
+        uses: actions/upload-artifact@v7
+        with:
+          name: dsh-tauri-desktop-installers
+          path: |
+            apps/tauri-desktop/target/release/bundle/msi/*.msi
+            apps/tauri-desktop/target/release/bundle/nsis/*.exe
+          if-no-files-found: error
