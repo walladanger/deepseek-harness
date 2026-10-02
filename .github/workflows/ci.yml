@@ -689,12 +689,23 @@ jobs:
           packages/workflow/tool-ralph/tests/integration.spec.ts
           packages/subprocess/subprocess-local/tests/process-exit.spec.ts
 
+  # Called as a reusable workflow (not a separate workflow file trigger) so its
+  # job can join the `all-checks-passed` aggregate below; `needs` cannot cross
+  # workflow files, so this is the only way this native Windows build/process
+  # check participates in the PR verdict (.github/AGENTS.md:3).
+  tauri-desktop-installer:
+    if: github.event_name == 'pull_request'
+    uses: ./.github/workflows/tauri-desktop-installer.yml
+
   # Single stable required check for branch protection: require "all checks
   # passed" instead of enumerating matrix legs whose names change as lanes and
   # node versions evolve. Every blocking job in THIS workflow must be listed in
   # `needs`. Native Windows build and process checks are required; Wine and
   # the deferred Python runtime targets live in ci-master.yml and do not
-  # participate in this PR verdict. `needs` cannot cross workflow files.
+  # participate in this PR verdict. `needs` cannot cross workflow files, so
+  # the Tauri desktop installer build joins here as a reusable `workflow_call`
+  # (the `tauri-desktop-installer` job above) rather than a `needs` reference
+  # into its own workflow file.
   # An explicit status function runs the verdict after failed/skipped needs
   # without keeping a cancelled workflow alive for an obsolete verdict.
   all-checks-passed:
@@ -714,7 +725,7 @@ jobs:
           && github.event.pull_request.user.login != 'dependabot[bot]'
           && fromJSON('["self-hosted", "linux", "x64", "vm-backup"]')
           || 'ubuntu-latest' }}
-    needs: [node-24, node-24-coverage, node-24-bench, node-24-consumers, node-compat, python-sdk, python-runtime, windows-build, windows-native-tests]
+    needs: [node-24, node-24-coverage, node-24-bench, node-24-consumers, node-compat, python-sdk, python-runtime, windows-build, windows-native-tests, tauri-desktop-installer]
     if: ${{ !cancelled() && github.event_name == 'pull_request' }}
     steps:
       - name: Fail if any needed job did not succeed

@@ -1,18 +1,13 @@
 # Builds the single-window Tauri desktop shell (apps/tauri-desktop) into an
 # MSI and NSIS installer. Separate from ci.yml because this is a Rust/Tauri
-# build on windows-latest, not part of the pnpm/Node workspace matrix.
+# build on windows-latest, not part of the pnpm/Node workspace matrix. Called
+# from ci.yml as a reusable workflow (`needs` cannot cross workflow files, so
+# this is how its job joins ci.yml's `all-checks-passed` aggregate) and kept
+# runnable manually via workflow_dispatch.
 name: Tauri Desktop Installer
 
 on:
-  pull_request:
-    paths:
-      - '.github/workflows/tauri-desktop-installer.yml'
-      - 'apps/tauri-desktop/**'
-  push:
-    branches: [master]
-    paths:
-      - '.github/workflows/tauri-desktop-installer.yml'
-      - 'apps/tauri-desktop/**'
+  workflow_call:
   workflow_dispatch:
 
 concurrency:
