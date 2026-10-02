@@ -48,3 +48,9 @@ worktrees/
 native/system/test/bin/
 apps/tauri-desktop/target/
 apps/tauri-desktop/gen/
+
+# gemini-cli settings
+.gemini/
+
+# GitHub App credentials
+gha-creds-*.json
