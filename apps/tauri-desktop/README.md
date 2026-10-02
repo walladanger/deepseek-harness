@@ -1,6 +1,6 @@
 # apps/tauri-desktop
 
-English
+English | [中文](README.zh.md)
 
 ## Summary
 
