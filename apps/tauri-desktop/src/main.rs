@@ -476,10 +476,12 @@ fn wait_for_exit(child: &mut Child, timeout: Duration) -> Option<ExitStatus> {
 /// was already reaped, so its numeric PID could since have been recycled by
 /// the OS, and signaling it now could hit an unrelated process.
 ///
-/// On Windows, `dsh` is launched through `cmd /C` (see `dsh_command`), so
-/// `child` is `cmd.exe`, not the Node process it starts in turn; killing
-/// only that direct child would leak the Node process and its bound port.
-/// `taskkill /T` targets the whole process tree instead.
+/// On Windows, a `.cmd`/`.bat` `dsh` (the common npm-style shim resolved by
+/// [`dsh_on_path_command`]) is run through Rust std's own implicit `cmd.exe`
+/// wrapping for batch-file targets, so `child` is `cmd.exe`, not the Node
+/// process it starts in turn; killing only that direct child would leak the
+/// Node process and its bound port. `taskkill /T` targets the whole process
+/// tree instead.
 fn terminate(mut child: Child) {
     // A leader that already exited (observed here or earlier by
     // `wait_for_ready_url`'s polling) still needs its group checked on Unix:
@@ -801,6 +803,10 @@ fn open_in_system_browser(url: &tauri::Url) {
         return;
     }
     let url = url.as_str();
+    // `spawn()`, not `status()`: this runs on `on_navigation`/`on_new_window`,
+    // called synchronously on the webview's own UI thread, so waiting here
+    // for the external opener to exit would freeze the shell's window for as
+    // long as that takes (an unresponsive browser launch, say).
     let result = if cfg!(target_os = "windows") {
         // Not `cmd /C start "" <url>`: `cmd.exe` re-parses its own command
         // line for its own metacharacters (`&`, `|`, ...) regardless of how
@@ -809,11 +815,11 @@ fn open_in_system_browser(url: &tauri::Url) {
         // any of them) could inject a second command. `rundll32` calls the
         // shell's URL-opening entry point directly, with no command
         // interpreter in between to reinterpret `url` at all.
-        no_console_window(Command::new("rundll32")).arg("url.dll,FileProtocolHandler").arg(url).status()
+        no_console_window(Command::new("rundll32")).arg("url.dll,FileProtocolHandler").arg(url).spawn()
     } else if cfg!(target_os = "macos") {
-        Command::new("open").arg(url).status()
+        Command::new("open").arg(url).spawn()
     } else {
-        Command::new("xdg-open").arg(url).status()
+        Command::new("xdg-open").arg(url).spawn()
     };
     if let Err(error) = result {
         eprintln!("dsh-tauri-desktop: failed to open {url} in the system browser: {error}");

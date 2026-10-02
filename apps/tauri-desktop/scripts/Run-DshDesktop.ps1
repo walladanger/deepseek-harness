@@ -106,9 +106,11 @@ if ($Stop) {
 if (-not $ExePath) {
     $installed = Join-Path $env:LOCALAPPDATA 'DeepSeek Harness (Tauri Preview)\dsh-tauri-desktop.exe'
     $programFiles = Join-Path ${env:ProgramFiles} 'DeepSeek Harness (Tauri Preview)\dsh-tauri-desktop.exe'
-    $programFilesX86 = Join-Path ${env:ProgramFiles(x86)} 'DeepSeek Harness (Tauri Preview)\dsh-tauri-desktop.exe'
+    # ${env:ProgramFiles(x86)} is unset on 32-bit Windows; Join-Path throws on
+    # a null -Path rather than treating it as "no such candidate".
+    $programFilesX86 = if (${env:ProgramFiles(x86)}) { Join-Path ${env:ProgramFiles(x86)} 'DeepSeek Harness (Tauri Preview)\dsh-tauri-desktop.exe' } else { $null }
     $localBuild = Join-Path $PSScriptRoot '..\target\release\dsh-tauri-desktop.exe'
-    $candidates = @($installed, $programFiles, $programFilesX86)
+    $candidates = @($installed, $programFiles, $programFilesX86) | Where-Object { $_ }
     $found = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
     if ($found) {
         $ExePath = $found
@@ -121,11 +123,6 @@ if (-not $ExePath) {
 
 if (-not (Test-Path $ExePath)) {
     throw "ExePath '$ExePath' does not exist."
-}
-
-if (Get-Process -Name $processName -ErrorAction SilentlyContinue) {
-    Write-Host "$processName is already running."
-    exit 0
 }
 
 # Saved so a stale value from an earlier invocation in this same PowerShell

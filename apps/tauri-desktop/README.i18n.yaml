@@ -1,6 +1,22 @@
-# Bilingual-pair consistency record (docs/i18n/README.md): the git blob hash of each
-# side as of the last confirmed-consistent state. Both languages carry equal authority;
-# after editing either side, bring the other along and re-record with:
+# Bilingual-pair consistency record for README.md (docs/i18n/README.md): per heading
+# section, a hash of its English and Chinese blocks outside code blocks and generated regions.
+# After editing either side, bring the other along and re-record with:
 #   pnpm run verify-translation-pairing --write apps/tauri-desktop/README.md
-README.md: 0482a6dfa12b339eba8fd2d5de90c9ef849bbc62
-README.zh.md: a886e6bb4dc7c5205bc353d12da503d48c49776e
+/apps-tauri-desktop:
+  en: 4c0577cbf9622915
+  zh: 58564f1dbe7a399a
+/apps-tauri-desktop/summary:
+  en: 3087053efe6e5b62
+  zh: 7af24f5e6e65ea0f
+/apps-tauri-desktop/launch-policy:
+  en: e93a67bea1894f96
+  zh: 7e9ecf0d301e3e96
+/apps-tauri-desktop/known-limitations:
+  en: f92177bba18939db
+  zh: 471337e7d8a70090
+/apps-tauri-desktop/use:
+  en: e3aeb2492746416e
+  zh: 8749d854b6845555
+/apps-tauri-desktop/development:
+  en: 78bc9703ba0ed029
+  zh: bc9492f1ffdf87a9

@@ -42,6 +42,9 @@ jobs:
           restore-keys: |
             tauri-desktop-cargo-${{ runner.os }}-
 
+      - name: Run unit tests
+        run: cargo test
+
       - name: Build MSI and NSIS installers
         uses: tauri-apps/tauri-action@v0
         with:
