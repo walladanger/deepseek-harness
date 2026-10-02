@@ -968,3 +968,94 @@ fn main() {
             }
         });
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PORT: &str = "5175";
+
+    fn ready_line(url: &str) -> String {
+        format!("dsh web: {url} ready")
+    }
+
+    #[test]
+    fn parse_ready_url_accepts_well_formed_announcement() {
+        let line = ready_line("http://127.0.0.1:5175/?token=abc123");
+        assert_eq!(parse_ready_url(&line, PORT), Some("http://127.0.0.1:5175/?token=abc123".to_string()));
+    }
+
+    #[test]
+    fn parse_ready_url_rejects_wrong_host() {
+        let line = ready_line("http://evil.example.com:5175/?token=abc123");
+        assert_eq!(parse_ready_url(&line, PORT), None);
+    }
+
+    #[test]
+    fn parse_ready_url_rejects_mismatched_port() {
+        let line = ready_line("http://127.0.0.1:9999/?token=abc123");
+        assert_eq!(parse_ready_url(&line, PORT), None);
+    }
+
+    #[test]
+    fn parse_ready_url_rejects_userinfo_authority_confusion() {
+        // Parses to host evil.example, with "127.0.0.1:5175" discarded as
+        // userinfo, not to host 127.0.0.1 — the exact confusion
+        // parse_ready_url's own doc comment describes.
+        let line = ready_line("http://127.0.0.1:5175@evil.example/?token=abc123");
+        assert_eq!(parse_ready_url(&line, PORT), None);
+    }
+
+    #[test]
+    fn parse_ready_url_rejects_duplicate_token() {
+        let line = ready_line("http://127.0.0.1:5175/?token=abc123&token=def456");
+        assert_eq!(parse_ready_url(&line, PORT), None);
+    }
+
+    #[test]
+    fn parse_ready_url_rejects_empty_token() {
+        let line = ready_line("http://127.0.0.1:5175/?token=");
+        assert_eq!(parse_ready_url(&line, PORT), None);
+    }
+
+    #[test]
+    fn parse_ready_url_rejects_missing_token() {
+        let line = ready_line("http://127.0.0.1:5175/");
+        assert_eq!(parse_ready_url(&line, PORT), None);
+    }
+
+    #[test]
+    fn parse_ready_url_rejects_wrong_path() {
+        let line = ready_line("http://127.0.0.1:5175/other?token=abc123");
+        assert_eq!(parse_ready_url(&line, PORT), None);
+    }
+
+    #[test]
+    fn parse_ready_url_accepts_canonicalized_default_port() {
+        // Port 80 is http's own default, normalized away by the URL parser;
+        // port_or_known_default() must still report it as the announced
+        // port so an explicit expected port of 80 matches.
+        let line = ready_line("http://127.0.0.1/?token=abc123");
+        assert_eq!(parse_ready_url(&line, "80"), Some("http://127.0.0.1/?token=abc123".to_string()));
+    }
+
+    #[test]
+    fn parse_ready_url_matches_any_port_when_expected_port_is_zero() {
+        // "0" (any numeric-zero form) is dsh web's "let the OS allocate a
+        // free port" value: this shell cannot know that port in advance, so
+        // it must match whatever port was actually announced.
+        let line = ready_line("http://127.0.0.1:54321/?token=abc123");
+        assert_eq!(parse_ready_url(&line, "0"), Some("http://127.0.0.1:54321/?token=abc123".to_string()));
+    }
+
+    #[test]
+    fn parse_ready_url_rejects_malformed_url() {
+        let line = ready_line("not a url");
+        assert_eq!(parse_ready_url(&line, PORT), None);
+    }
+
+    #[test]
+    fn parse_ready_url_rejects_lines_without_the_dsh_web_prefix() {
+        assert_eq!(parse_ready_url("http://127.0.0.1:5175/?token=abc123", PORT), None);
+    }
+}
