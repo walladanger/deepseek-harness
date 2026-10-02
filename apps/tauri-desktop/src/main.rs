@@ -172,16 +172,15 @@ fn dsh_command() -> Option<(Command, String)> {
 fn dsh_on_path_command() -> Option<(Command, String)> {
     let resolved = resolve_dsh_on_path()?;
     let attempted = format!("`dsh` on PATH ({})", resolved.display());
-    let is_script =
-        resolved.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat"));
-    let command = if is_script {
-        let mut command = Command::new("cmd");
-        command.arg("/C").arg(&resolved);
-        command
-    } else {
-        Command::new(&resolved)
-    };
-    Some((command, attempted))
+    // Rust's std already runs a `.cmd`/`.bat` target through `cmd.exe` with
+    // correct batch-file quoting (the CVE-2024-24576 fix), so a resolved path
+    // is passed to Command::new directly for every extension rather than
+    // hand-building a `cmd /C <path>` line: cmd.exe's own `/C` quote removal
+    // rules drop the first and last quote when the quoted text contains
+    // `&<>()@^|`, which splits a path containing both a space and one of
+    // those characters (e.g. under `C:\Program Files (x86)\...`) at the first
+    // space and fails the launch.
+    Some((Command::new(&resolved), attempted))
 }
 
 #[cfg(not(windows))]

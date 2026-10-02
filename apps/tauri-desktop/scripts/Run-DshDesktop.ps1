@@ -80,7 +80,18 @@ if ($Stop) {
         foreach ($process in $stillRunning) {
             # taskkill /T kills the shell's own dsh/cmd.exe/node subtree too;
             # Stop-Process -Force would kill only the shell itself and leak them.
+            # $ErrorActionPreference does not turn taskkill's own nonzero exit
+            # into a terminating error, so its result is checked explicitly.
             & taskkill.exe /PID $process.Id /T /F | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+                Write-Error "taskkill failed for PID $($process.Id) (exit code $LASTEXITCODE); $processName may still be running."
+                exit 1
+            }
+        }
+        $stillRunning = Get-Process -Name $processName -ErrorAction SilentlyContinue
+        if ($stillRunning) {
+            Write-Error "$processName is still running after taskkill reported success."
+            exit 1
         }
     }
     Write-Host "Stopped $processName."
