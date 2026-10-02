@@ -29,24 +29,72 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          # A PR comment's default checkout is the base branch; check out the
-          # PR's own head so a requested fix has something to commit onto.
-          ref: >-
-            ${{ github.event.issue.pull_request &&
-                format('refs/pull/{0}/head', github.event.issue.number) ||
-                github.ref }}
+          fetch-depth: 0
+
+      # A PR whose head is an external fork gets write-access execution
+      # over its own untrusted content otherwise: pre-commit hooks,
+      # package.json scripts, and the agent's own commit/push all run
+      # against that fork's tree with this job's contents:write permission.
+      - name: Verify the PR head is this repository's own branch
+        if: ${{ github.event.issue.pull_request }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          head_repo_full=$(gh pr view "${{ github.event.issue.number }}" --json headRepository --jq '.headRepository.nameWithOwner')
+          if [ "${head_repo_full}" != "${{ github.repository }}" ]; then
+            echo "::error::PR #${{ github.event.issue.number }} head is an external fork (${head_repo_full}); gemini-invoke does not run against fork checkouts."
+            exit 1
+          fi
+
+      # A checkout of refs/pull/N/head lands in detached HEAD, so `git push`
+      # to "the current branch" has nothing to push to; check out the PR's
+      # actual named branch instead.
+      - name: Check out the PR branch
+        if: ${{ github.event.issue.pull_request }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh pr checkout ${{ github.event.issue.number }}
 
       - name: Configure git identity for commits
         run: |
           git config user.name "gemini-cli[bot]"
           git config user.email "gemini-cli[bot]@users.noreply.github.com"
 
+      # .gemini/ and .env are stripped even on a checkout this job already
+      # verified is this repository's own branch, guarding against a
+      # compromised or stale branch. .agents/ is deliberately left alone:
+      # this job's own author_association and same-repository gates mean
+      # only an existing collaborator can reach it, and a developer's own
+      # in-flight PR may legitimately be editing skills or Agent Notes
+      # under .agents/ — resetting it here would stage a revert of their
+      # work that the agent's next commit would push back to their branch.
+      - name: Remove untrusted workspace configuration
+        run: rm -rf .gemini .env
+
+      # google-github-actions/run-gemini-cli's own env: block does not
+      # reach the token into Gemini CLI's shell tool, which strips
+      # GH_TOKEN/GITHUB_TOKEN from spawned subprocesses; authenticate gh
+      # at the system level instead so the agent's own `gh`/`git` tool
+      # calls (commenting, committing, pushing) stay authenticated.
+      - name: Authenticate GitHub CLI
+        run: |
+          echo "${{ github.token }}" | gh auth login --with-token
+          gh auth setup-git
+
       - name: Run Gemini CLI
         uses: google-github-actions/run-gemini-cli@v0
+        env:
+          # The checked-out CI workspace is never interactively trusted, so
+          # Gemini CLI's headless trusted-folder check must be bypassed here.
+          GEMINI_CLI_TRUST_WORKSPACE: 'true'
         with:
           gemini_api_key: ${{ secrets.GEMINI_CLI_KEY }}
+          # '' && '' || y evaluates '' as falsy the same as the object it
+          # replaces would be, so github_issue_number's truthy branch can't
+          # be '' the way github_pr_number's falsy branch is; negate the
+          # condition instead so the truthy branch is always the number.
           github_pr_number: ${{ github.event.issue.pull_request && github.event.issue.number || '' }}
-          github_issue_number: ${{ github.event.issue.pull_request && '' || github.event.issue.number }}
+          github_issue_number: ${{ !github.event.issue.pull_request && github.event.issue.number || '' }}
           prompt: |
             You were mentioned as @gemini-cli in a comment on
             ${{ github.event.issue.pull_request && 'pull request' || 'issue' }}
@@ -56,6 +104,8 @@ jobs:
 
             Follow this repository's AGENTS.md conventions. If the request asks you to fix,
             implement, or change code and this is a pull request, make the smallest correct
-            change, commit it with a clear message, and push it to the current branch. If the
-            request is a question or asks for an explanation, reply as a comment instead of
-            pushing anything.
+            change, commit it with a clear message, and push it to the current branch. If this
+            is an issue rather than a pull request, never commit or push to the current branch
+            (it is the repository's default branch); instead create a new branch, commit the
+            change there, and open a pull request. If the request is a question or asks for an
+            explanation, reply as a comment instead of pushing anything.
