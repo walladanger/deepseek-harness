@@ -471,10 +471,13 @@ fn wait_for_exit(child: &mut Child, timeout: Duration) -> Option<ExitStatus> {
 /// `taskkill /F` is honest about that gap instead of waiting out a 5s grace
 /// period that was never actually requesting anything.
 ///
-/// Checks `try_wait()` before signaling at all: on Unix, an exit status
-/// already observed by [`wait_for_ready_url`]'s polling means the process
-/// was already reaped, so its numeric PID could since have been recycled by
-/// the OS, and signaling it now could hit an unrelated process.
+/// Checks `try_wait()` before signaling the leader's own PID: on Unix, an
+/// exit status already observed by [`wait_for_ready_url`]'s polling means
+/// the leader was already reaped, so its numeric PID could since have been
+/// recycled by the OS, and signaling it now could hit an unrelated process.
+/// This only skips the leader-targeted `SIGTERM` and its grace-period wait,
+/// not the process-group check that follows — see the group-aliveness
+/// comment inline below for why that check still runs either way.
 ///
 /// On Windows, a `.cmd`/`.bat` `dsh` (the common npm-style shim resolved by
 /// [`dsh_on_path_command`]) is run through Rust std's own implicit `cmd.exe`
@@ -487,10 +490,17 @@ fn terminate(mut child: Child) {
     // `wait_for_ready_url`'s polling) still needs its group checked on Unix:
     // a same-group descendant (a tool/plugin subprocess dsh spawned and left
     // detached) can outlive dsh itself, and only a numeric PID reuse risk —
-    // not "the leader is gone" — makes signaling unsafe. On Windows the
-    // child is `cmd.exe` directly wrapping the process tree `taskkill /T`
-    // targets, so an already-exited leader has no separate tree to clean up
-    // and can return early.
+    // not "the leader is gone" — makes signaling the leader's own PID unsafe;
+    // the group-targeted `kill -0`/`kill -KILL` below do not reuse that PID,
+    // so they still run even when `leader_exited` is true. On Windows,
+    // `taskkill /PID <pid> /T` needs that PID to still exist to walk its
+    // process tree at all: once the leader has already exited, there is no
+    // PID left to retarget, so this returns early rather than attempting a
+    // call that cannot work. Any descendant that survived the leader (a
+    // detached tool/plugin subprocess, same as the Unix case) is outside
+    // this shell's reach at that point, for the same reason: there is no
+    // PID or scope identifier left here to act on.
+
     let leader_exited = match child.try_wait() {
         Ok(Some(_)) => true,
         Ok(None) => false,
@@ -821,8 +831,19 @@ fn open_in_system_browser(url: &tauri::Url) {
     } else {
         Command::new("xdg-open").arg(url).spawn()
     };
-    if let Err(error) = result {
-        eprintln!("dsh-tauri-desktop: failed to open {url} in the system browser: {error}");
+    match result {
+        // Dropping a `Child` does not wait on or reap it; on Unix a process
+        // nobody waits on stays a zombie in the process table until this
+        // shell itself exits. A detached reaper thread waits on it without
+        // blocking the caller (the webview's UI thread).
+        Ok(mut child) => {
+            thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
+        Err(error) => {
+            eprintln!("dsh-tauri-desktop: failed to open {url} in the system browser: {error}");
+        }
     }
 }
 

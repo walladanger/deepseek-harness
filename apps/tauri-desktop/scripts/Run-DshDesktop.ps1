@@ -88,7 +88,11 @@ if ($Stop) {
             # $ErrorActionPreference does not turn taskkill's own nonzero exit
             # into a terminating error, so its result is checked explicitly.
             & taskkill.exe /PID $process.Id /T /F | Out-Null
-            if ($LASTEXITCODE -ne 0) {
+            # A nonzero exit here can mean the process exited on its own between
+            # the $stillRunning snapshot and this call (the earlier graceful
+            # CloseMainWindow request landing late, say), not that the kill
+            # failed — Get-Process confirms which before treating it as fatal.
+            if ($LASTEXITCODE -ne 0 -and (Get-Process -Id $process.Id -ErrorAction SilentlyContinue)) {
                 Write-Error "taskkill failed for PID $($process.Id) (exit code $LASTEXITCODE); $processName may still be running."
                 exit 1
             }

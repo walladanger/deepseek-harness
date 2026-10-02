@@ -8,6 +8,8 @@
 
 它正与既有的、基于 Electron 的 `apps/desktop` 并行评估，目前两者互不取代。它的产品名称被刻意取得与之不同（“DeepSeek Harness (Tauri Preview)”），这样把它和 `apps/desktop` 一起安装时，不会与后者的开始菜单快捷方式和安装程序标识（两者都使用纯粹的 “DeepSeek Harness” 名称）发生冲突或覆盖。
 
+<a id="launch-policy"></a>
+
 ## 启动策略
 
 该外壳从不在 `dsh` profile 之外自行启动 harness：启动时，它会在某个工作目录（可通过 `DSH_WEB_WORKSPACE` 覆盖，否则默认为当前用户的主目录）中派生（spawn）`dsh --profile web --host 127.0.0.1 --port <port> --no-open`（可通过 `DSH_CLI_PATH`、`DSH_WEB_PORT` 覆盖），并在自身整个生命周期内持有该子进程。`127.0.0.1` 不可配置：`dsh web` 自身的配置 schema 只接受该值或 `0.0.0.0`，而 CLI 出于安全考虑本身就拒绝 `0.0.0.0`，因此这并非真正意义上的可配置项。harness 进程本身始终通过 `web` profile 启动，依据
