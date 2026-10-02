@@ -136,7 +136,14 @@ rather than fixed:
 ## Development
 
 Requires the Rust toolchain and, on Windows, the Tauri v2 prerequisites
-(WebView2, MSVC build tools). `icons/` holds the bundled window/installer
+(WebView2, MSVC build tools). On Linux, the Tauri v2 prerequisites are
+GTK and WebKitGTK development packages — on Debian/Ubuntu,
+`libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev
+libssl-dev libayatana-appindicator3-dev librsvg2-dev` (see the
+[Tauri v2 Linux prerequisites](https://v2.tauri.app/start/prerequisites/#linux)
+for other distributions); without them, `cargo check`/`cargo build` fails
+while compiling the `gdk-sys` build script. `icons/` holds the bundled
+window/installer
 icons. `tauri.conf.json` declares an empty `app.windows` array because the
 single window is created at runtime in `src/main.rs`, before the wrapped
 `dsh web` process has announced its authenticated launch URL.

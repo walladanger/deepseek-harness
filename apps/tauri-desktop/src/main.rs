@@ -92,8 +92,8 @@ fn own_process_group(command: Command) -> Command {
 /// Searches `PATH` (this process's own environment, not the child's) for a
 /// `dsh` launcher, checking each directory for `dsh.exe`, `dsh.cmd`,
 /// `dsh.bat`, then bare `dsh`, and returning the first match's full path.
-/// `None` if `PATH` is unset or unset a nothing named `dsh` in any of its
-/// directories.
+/// `None` if `PATH` is unset or none of its directories contain anything
+/// named `dsh`.
 ///
 /// Resolving `PATH` this way, before the child's own working directory is
 /// ever set, and launching the concrete result rather than a bare `dsh`
@@ -822,11 +822,18 @@ fn open_in_system_browser(url: &tauri::Url) {
 /// that this single-window shell has nowhere else to show, and is routed to
 /// the system browser via [`open_in_system_browser`] instead — the same
 /// disposition `apps/desktop`'s Electron shell gives such links.
+///
+/// `data:` is trusted only while `allowed_origin` is still unset: the shell
+/// itself only ever navigates to a `data:` page during startup, before
+/// `allowed_origin` is set (see [`LOADING_HTML`] and `message_page`'s call
+/// sites in [`main`]); once the real dsh web origin has loaded, a `data:`
+/// URL can only be content the loaded page itself supplied, which must not
+/// be allowed to replace the window's content with arbitrary HTML.
 fn should_load_in_window(url: &tauri::Url, allowed_origin: &Mutex<Option<String>>) -> bool {
-    if url.scheme() == "data" {
-        return true;
-    }
     let allowed = allowed_origin.lock().expect("allowed-origin mutex poisoned");
+    if url.scheme() == "data" {
+        return allowed.is_none();
+    }
     allowed.as_deref() == Some(url.origin().ascii_serialization().as_str())
 }
 

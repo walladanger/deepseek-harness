@@ -73,8 +73,13 @@ if ($Stop) {
         # Stop-Process -Force would skip that handler and leak the child.
         [void]$process.CloseMainWindow()
     }
-    $exited = $running | Wait-Process -Timeout 10 -ErrorAction SilentlyContinue
-    $stillRunning = Get-Process -Name $processName -ErrorAction SilentlyContinue
+    # Wait-Process -Timeout is not available in Windows PowerShell 5.1
+    # (#Requires -Version 5.1 above), so the 10s wait is polled by hand.
+    $deadline = (Get-Date).AddSeconds(10)
+    do {
+        Start-Sleep -Milliseconds 200
+        $stillRunning = Get-Process -Name $processName -ErrorAction SilentlyContinue
+    } while ($stillRunning -and (Get-Date) -lt $deadline)
     if ($stillRunning) {
         Write-Warning "$processName did not close within 10s; force-stopping its process tree."
         foreach ($process in $stillRunning) {
