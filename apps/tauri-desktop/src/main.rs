@@ -13,6 +13,8 @@ use std::time::{Duration, Instant};
 
 use tauri::{AppHandle, Manager, State, WebviewUrl, WebviewWindowBuilder};
 
+mod locale;
+
 /// `dsh web`'s `WebServer.Config` schema (`packages/host/webserver`) accepts
 /// only `127.0.0.1` or `0.0.0.0` as `host`, and the Web CLI itself refuses
 /// `0.0.0.0` outright ("intentionally not supported yet for safety"). There
@@ -638,14 +640,18 @@ fn shutdown(profile: &State<WebProfile>) {
     stop_running_child(profile);
 }
 
-const LOADING_HTML: &str = "data:text/html;charset=utf-8,\
-<!doctype html><html><body style='background:%23111;color:%23eee;\
-font-family:sans-serif;display:flex;align-items:center;\
-justify-content:center;height:100vh;margin:0'>\
-<p>Starting DeepSeek Harness&hellip;</p></body></html>";
-
-const TIMEOUT_MESSAGE: &str =
-    "dsh web did not become reachable within 30s. Check that `dsh` is on PATH and the configured port is free, then restart.";
+/// Builds the `data:` URL for the loading placeholder page, styled the same
+/// as [`message_page`]'s diagnostic pages.
+fn loading_html() -> String {
+    format!(
+        "data:text/html;charset=utf-8,\
+         <!doctype html><html><body style='background:%23111;color:%23eee;\
+         font-family:sans-serif;display:flex;align-items:center;\
+         justify-content:center;height:100vh;margin:0'>\
+         <p>{}</p></body></html>",
+        locale::EN.starting
+    )
+}
 
 /// Escapes `message` for safe embedding as HTML text content, then
 /// percent-encodes the result for a `data:` URL.
@@ -684,7 +690,7 @@ fn encode_message(message: &str) -> String {
 }
 
 /// Builds a `data:` URL for a short diagnostic message, styled the same as
-/// [`LOADING_HTML`]. `message` is treated as untrusted plain text (it may
+/// [`loading_html`]. `message` is treated as untrusted plain text (it may
 /// carry arbitrary process output) and rendered as such; see
 /// [`encode_message`].
 fn message_page(message: &str) -> String {
@@ -714,9 +720,9 @@ fn startup_failure_page(captured_stderr: &Mutex<Vec<u8>>, stderr_done: &mpsc::Re
     let captured = captured_stderr.lock().expect("stderr capture mutex poisoned");
     let diagnostic = String::from_utf8_lossy(&captured);
     if diagnostic.trim().is_empty() {
-        message_page(TIMEOUT_MESSAGE)
+        message_page(locale::EN.timeout_generic)
     } else {
-        message_page(&format!("dsh web failed to start:\n\n{diagnostic}"))
+        message_page(&format!("{}:\n\n{diagnostic}", locale::EN.startup_failed_prefix))
     }
 }
 
@@ -825,7 +831,7 @@ fn open_in_system_browser(url: &tauri::Url) {
 ///
 /// `data:` is trusted only while `allowed_origin` is still unset: the shell
 /// itself only ever navigates to a `data:` page during startup, before
-/// `allowed_origin` is set (see [`LOADING_HTML`] and `message_page`'s call
+/// `allowed_origin` is set (see [`loading_html`] and `message_page`'s call
 /// sites in [`main`]); once the real dsh web origin has loaded, a `data:`
 /// URL can only be content the loaded page itself supplied, which must not
 /// be allowed to replace the window's content with arbitrary HTML.
@@ -858,7 +864,7 @@ fn main() {
         .setup(move |app: &mut tauri::App| {
             let navigation_origin = Arc::clone(&allowed_origin);
             let readiness_origin = Arc::clone(&allowed_origin);
-            WebviewWindowBuilder::new(app, "main", WebviewUrl::External(LOADING_HTML.parse()?))
+            WebviewWindowBuilder::new(app, "main", WebviewUrl::External(loading_html().parse()?))
                 .title("DeepSeek Harness")
                 .inner_size(1280.0, 860.0)
                 .min_inner_size(800.0, 600.0)
@@ -919,12 +925,12 @@ fn main() {
                     }
                     Err(error) => {
                         record_spawn_outcome(&profile, None);
-                        message_page(&format!("failed to launch dsh --profile web ({attempted}): {error}"))
+                        message_page(&format!("{} ({attempted}): {error}", locale::EN.launch_failed_prefix))
                     }
                 };
                 if let Some(window) = handle.get_webview_window("main") {
                     let target: tauri::Url = url.parse().unwrap_or_else(|error| {
-                        message_page(&format!("dsh web announced an unparseable URL ({error}): {url}"))
+                        message_page(&format!("{} ({error}): {url}", locale::EN.unparseable_url_prefix))
                             .parse()
                             .expect("message_page always produces a well-formed data: URL")
                     });
